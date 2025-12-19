@@ -40,7 +40,7 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     # 真实标签 + 坐标
     data = load_spatial_multiome(str(h5ad_path))
     coords = data.coords
-    labels = data.labels
+    labels = data.labels  # 保持原始字符串标签
     uniq = {v: i for i, v in enumerate(sorted(set(labels)))} if labels is not None else None
     y_true = np.array([uniq[v] for v in labels], dtype=int) if labels is not None else None
 
@@ -64,14 +64,6 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     x = coords[:, 1] if coords.shape[1] > 1 else coords[:, 0]
     y = -coords[:, 0]
     # 按 majority vote 将 pred 索引映射回真实 domain，再按 domain_color_dict 着色
-    domain_colors = {
-        "BS": "#ff909f",
-        "CNU": "#98d6f9",
-        "FiberTracts": "#cccccc",
-        "HIP": "#7ed04b",
-        "Isocortex": "#1f9d5a",
-        "VS": "#ffcf00",
-    }
     domain_colors = {
         "BS": "#ff909f",
         "CNU": "#98d6f9",
