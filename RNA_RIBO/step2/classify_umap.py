@@ -18,6 +18,13 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from .data import load_spatial_multiome  # noqa: E402
 import scanpy as sc  # noqa: E402
+import debugpy
+
+print("正在启动调试服务器，端口：9999")
+debugpy.listen(9999)
+print("等待调试客户端连接...")
+debugpy.wait_for_client()
+print("调试客户端已连接，继续执行...")
 
 
 def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu", out_name: str = "spatial_pred.png"):
@@ -63,33 +70,16 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     # 空间坐标着色（参考 visualize），并按 protocol-replicate 拆分左右子图
     x = coords[:, 1] if coords.shape[1] > 1 else coords[:, 0]
     y = -coords[:, 0]
-    # 按 majority vote 将 pred 索引映射回真实 domain，再按 domain_color_dict 着色
+    # 使用固定的索引->颜色映射
     domain_colors = {
-        "BS": "#ff909f",
-        "CNU": "#98d6f9",
-        "FiberTracts": "#cccccc",
-        "HIP": "#7ed04b",
-        "Isocortex": "#1f9d5a",
-        "VS": "#ffcf00",
+        5: "#ff909f",
+        0: "#98d6f9",
+        1: "#cccccc",
+        4: "#7ed04b",
+        2: "#1f9d5a",
+        3: "#ffcf00",
     }
-
-    pred_to_dom = {}
-    if labels is not None:
-        uniq = {v: i for i, v in enumerate(sorted(set(labels)))}
-        true_int = np.array([uniq[v] for v in labels], dtype=int)
-        inv = {i: v for v, i in uniq.items()}
-        cm = np.zeros((len(np.unique(pred)), len(np.unique(true_int))), dtype=int)
-        for p, t in zip(pred, true_int):
-            cm[p, t] += 1
-        for p in range(cm.shape[0]):
-            t_idx = cm[p].argmax()
-            pred_to_dom[p] = inv[t_idx]
-    # 映射颜色；未知/缺失映射的设为灰色
-    colors = []
-    for p in pred:
-        dom = pred_to_dom.get(p)
-        colors.append(domain_colors.get(dom, "#000000"))
-    colors = np.array(colors)
+    colors = np.array([domain_colors.get(int(p), "#000000") for p in pred])
 
     prot = data.adata.obs.get("protocol-replicate", None)
     unique_prot = prot.unique().tolist() if prot is not None else [None]
@@ -107,13 +97,12 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
         ax.invert_xaxis()
         ax.axis("off")
         ax.set_title(str(val))
-    # Legend
-    if labels is not None:
-        used_domains = sorted(set(pred_to_dom.values()))
-        for name in used_domains:
-            handles.append(plt.Line2D([0], [0], marker='o', color='w', label=name,
-                                      markerfacecolor=domain_colors.get(name, "#000000"), markersize=6))
-            labels_legend.append(name)
+    # Legend: 使用固定索引标签
+    used_preds = sorted(set(pred))
+    for cls in used_preds:
+        handles.append(plt.Line2D([0], [0], marker='o', color='w', label=str(cls),
+                                  markerfacecolor=domain_colors.get(int(cls), "#000000"), markersize=6))
+        labels_legend.append(str(cls))
     fig.legend(handles, labels_legend, loc="upper right", bbox_to_anchor=(1.05, 1.05))
     plt.tight_layout()
     plt.savefig(run_dir / out_name, dpi=120)
