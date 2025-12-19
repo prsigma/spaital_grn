@@ -63,11 +63,8 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     # 空间坐标着色（参考 visualize），并按 protocol-replicate 拆分左右子图
     x = coords[:, 1] if coords.shape[1] > 1 else coords[:, 0]
     y = -coords[:, 0]
-    # 使用对比度更高的调色板（tab10/Set1 等），并添加 legend
-    palette = [
-        "#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b",
-        "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
-    ]
+    # 固定 6 色高对比调色板（按类别索引映射）
+    palette = ["#ff909f", "#98d6f9", "#cccccc", "#7ed04b", "#1f9d5a", "#ffcf00"]
     colors = np.array([palette[i % len(palette)] for i in pred])
 
     prot = data.adata.obs.get("protocol-replicate", None)
