@@ -161,10 +161,25 @@ class SpatialFusionModel(nn.Module):
         temperature: float = 0.07,
         adapter_dim: Optional[int] = None,
         adapter_dropout: float = 0.0,
+        gene_dim: Optional[int] = None,
+        w_tx: Optional[torch.Tensor] = None,
+        w_ribo: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.adapter_rna = Adapter(dim, adapter_dim, adapter_dropout) if adapter_dim else None
         self.adapter_ribo = Adapter(dim, adapter_dim, adapter_dropout) if adapter_dim else None
+        self.use_gene_emb = gene_dim is not None and w_tx is not None and w_ribo is not None
+        if self.use_gene_emb:
+            self.E_tx = nn.Parameter(torch.randn(w_tx.shape[1], gene_dim))
+            self.E_ribo = nn.Parameter(torch.randn(w_ribo.shape[1], gene_dim))
+            self.register_buffer("W_tx", w_tx)
+            self.register_buffer("W_ribo", w_ribo)
+            if gene_dim != dim:
+                self.tx_proj = nn.Linear(gene_dim, dim, bias=False)
+                self.ribo_proj = nn.Linear(gene_dim, dim, bias=False)
+            else:
+                self.tx_proj = None
+                self.ribo_proj = None
         self.fusion = DynamicFusionAttention(dim)
         gcn_dims = [dim] + [gcn_hidden] * (gcn_layers - 1) + [dim]
         self.gcn_blocks = nn.ModuleList(
@@ -185,6 +200,15 @@ class SpatialFusionModel(nn.Module):
         z_ribo: torch.Tensor,
         adj_spatial: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
+        if self.use_gene_emb:
+            z_tx_gene = torch.sparse.mm(self.W_tx, self.E_tx) if self.W_tx.is_sparse else self.W_tx @ self.E_tx
+            z_ribo_gene = torch.sparse.mm(self.W_ribo, self.E_ribo) if self.W_ribo.is_sparse else self.W_ribo @ self.E_ribo
+            if self.tx_proj is not None:
+                z_tx_gene = self.tx_proj(z_tx_gene)
+                z_ribo_gene = self.ribo_proj(z_ribo_gene)
+            z_rna = z_rna + z_tx_gene
+            z_ribo = z_ribo + z_ribo_gene
+
         if self.adapter_rna is not None:
             z_rna = self.adapter_rna(z_rna)
         if self.adapter_ribo is not None:

@@ -142,13 +142,4 @@ def build_graphs(
         else build_spatial_knn_graph(coords[:, :2], k=k_spatial, include_self=False, normalize=True)
     )
 
-    # 如果提供标签，去掉跨域边
-    if labels is not None:
-        adj = adj_spatial.coalesce()
-        idx = adj.indices()
-        val = adj.values()
-        keep = labels[idx[0]] == labels[idx[1]]
-        adj = torch.sparse_coo_tensor(idx[:, keep], val[keep], size=adj.shape)
-        adj_spatial = adj.coalesce()
-
     return {"adj_spatial": adj_spatial}

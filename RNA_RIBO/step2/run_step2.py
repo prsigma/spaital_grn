@@ -34,6 +34,7 @@ from torch.serialization import add_safe_globals  # noqa: E402
 
 from .data import load_spatial_multiome  # noqa: E402
 from .graph import build_spatial_knn_graph  # noqa: E402
+from .starnet_weights import build_starnet_weights  # noqa: E402
 from .model import SpatialFusionModel  # noqa: E402
 
 
@@ -97,6 +98,10 @@ def train_step2(
     min_delta: float = 1e-4,
     adapter_dim: Optional[int] = None,
     adapter_dropout: float = 0.0,
+    gene_dim: Optional[int] = 128,
+    gamma: float = 3.0,
+    k_top: int = 30,
+    w_resample: float = 0.8,
     k_spatial: int = 15,
     batch_size: int = 512,
     num_workers: int = 0,
@@ -119,6 +124,10 @@ def train_step2(
                 min_delta=min_delta,
                 adapter_dim=adapter_dim,
                 adapter_dropout=adapter_dropout,
+                gene_dim=gene_dim,
+                gamma=gamma,
+                k_top=k_top,
+                w_resample=w_resample,
                 k_spatial=k_spatial,
                 batch_size=batch_size,
                 num_workers=num_workers,
@@ -139,7 +148,7 @@ def train_step2(
         labels = torch.tensor([uniq[v] for v in data.labels], dtype=torch.long)
 
     # 2) 构建空间邻接
-    adj_spatial = build_spatial_knn_graph(data.coords, k=k_spatial, labels=labels)
+    adj_spatial = build_spatial_knn_graph(data.coords, k=k_spatial)
 
     # 3) 提取预训练 embedding
     z_rna, z_ribo = extract_embeddings(
@@ -152,6 +161,13 @@ def train_step2(
         ribo_layer=ribo_layer,
     )
 
+    # 4) 构造 STARNet 权重并初始化基因 embedding
+    w_tx = build_starnet_weights(data.rna, gamma=gamma, k_top=k_top, w_resample=w_resample)
+    w_ribo = build_starnet_weights(data.ribo, gamma=gamma, k_top=k_top, w_resample=w_resample)
+    # 移到 device
+    w_tx = w_tx.to(device)
+    w_ribo = w_ribo.to(device)
+
     # 4) 训练融合模型（全图批次）
     model = SpatialFusionModel(
         dim=z_rna.size(1),
@@ -159,6 +175,9 @@ def train_step2(
         gcn_layers=2,
         adapter_dim=adapter_dim,
         adapter_dropout=adapter_dropout,
+        gene_dim=gene_dim,
+        w_tx=w_tx,
+        w_ribo=w_ribo,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     if eta_min is None:
@@ -266,6 +285,10 @@ def parse_args():
     parser.add_argument("--min_delta", type=float, default=1e-4, help="early stopping 改善阈值")
     parser.add_argument("--adapter_dim", type=int, default=None, help="Adapter 瓶颈维度，None 表示不启用")
     parser.add_argument("--adapter_dropout", type=float, default=0.0, help="Adapter dropout")
+    parser.add_argument("--gene_dim", type=int, default=128, help="基因 embedding 维度，None 关闭基因部分")
+    parser.add_argument("--gamma", type=float, default=3.0, help="STARNet gamma 指数")
+    parser.add_argument("--k_top", type=int, default=30, help="每个 spot 选取的基因数（top-k）")
+    parser.add_argument("--w_resample", type=float, default=0.8, help="STARNet 混合系数")
     parser.add_argument("--k_spatial", type=int, default=15)
     parser.add_argument("--lambda_domain", type=float, default=1)
     parser.add_argument("--batch_size", type=int, default=512, help="提取预训练 embedding 的批大小")
