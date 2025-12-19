@@ -60,18 +60,26 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
         print(metrics)
         (run_dir / "pred_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    # 空间坐标着色（参考 visualize）
+    # 空间坐标着色（参考 visualize），并按 protocol-replicate 拆分左右子图
     x = coords[:, 1] if coords.shape[1] > 1 else coords[:, 0]
     y = -coords[:, 0]
     palette = sc.pl.palettes.default_20
-    colors = [palette[i % len(palette)] for i in pred]
+    colors = np.array([palette[i % len(palette)] for i in pred])
 
-    plt.figure(figsize=(8.4, 8.14))
-    plt.scatter(x, y, c=colors, s=2.0, alpha=0.8, linewidths=0)
-    ax = plt.gca()
-    ax.invert_yaxis()
-    ax.invert_xaxis()
-    ax.axis("off")
+    prot = data.adata.obs.get("protocol-replicate", None)
+    unique_prot = prot.unique().tolist() if prot is not None else [None]
+
+    n_cols = len(unique_prot)
+    fig, axes = plt.subplots(1, n_cols, figsize=(8.4 * n_cols, 8.14))
+    if n_cols == 1:
+        axes = [axes]
+    for ax, val in zip(axes, unique_prot):
+        mask = prot == val if prot is not None else np.ones_like(pred, dtype=bool)
+        ax.scatter(x[mask], y[mask], c=colors[mask], s=2.0, alpha=0.8, linewidths=0)
+        ax.invert_yaxis()
+        ax.invert_xaxis()
+        ax.axis("off")
+        ax.set_title(str(val))
     plt.tight_layout()
     plt.savefig(run_dir / out_name, dpi=120)
     plt.close()
