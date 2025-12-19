@@ -63,7 +63,9 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     # 空间坐标着色（参考 visualize），并按 protocol-replicate 拆分左右子图
     x = coords[:, 1] if coords.shape[1] > 1 else coords[:, 0]
     y = -coords[:, 0]
-    palette = sc.pl.palettes.default_20
+    # 使用对比度更高的调色板（tab10/Set1 等），并添加 legend
+    base_palette = plt.get_cmap("tab10")
+    palette = [base_palette(i) for i in range(num_classes)] if num_classes else [base_palette(i) for i in range(10)]
     colors = np.array([palette[i % len(palette)] for i in pred])
 
     prot = data.adata.obs.get("protocol-replicate", None)
@@ -73,6 +75,8 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     fig, axes = plt.subplots(1, n_cols, figsize=(8.4 * n_cols, 8.14))
     if n_cols == 1:
         axes = [axes]
+    handles = []
+    labels_legend = []
     for ax, val in zip(axes, unique_prot):
         mask = prot == val if prot is not None else np.ones_like(pred, dtype=bool)
         ax.scatter(x[mask], y[mask], c=colors[mask], s=2.0, alpha=0.8, linewidths=0)
@@ -80,6 +84,12 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
         ax.invert_xaxis()
         ax.axis("off")
         ax.set_title(str(val))
+    # Legend
+    for cls in range(num_classes if num_classes else len(np.unique(pred))):
+        handles.append(plt.Line2D([0], [0], marker='o', color='w', label=str(cls),
+                                  markerfacecolor=palette[cls % len(palette)], markersize=6))
+        labels_legend.append(str(cls))
+    fig.legend(handles, labels_legend, loc="upper right", bbox_to_anchor=(1.05, 1.05))
     plt.tight_layout()
     plt.savefig(run_dir / out_name, dpi=120)
     plt.close()
