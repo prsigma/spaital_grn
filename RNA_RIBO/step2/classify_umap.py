@@ -63,9 +63,31 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     # 空间坐标着色（参考 visualize），并按 protocol-replicate 拆分左右子图
     x = coords[:, 1] if coords.shape[1] > 1 else coords[:, 0]
     y = -coords[:, 0]
-    # 固定 6 色高对比调色板（按类别索引映射）
-    palette = ["#ff909f", "#98d6f9", "#cccccc", "#7ed04b", "#1f9d5a", "#ffcf00"]
-    colors = np.array([palette[i % len(palette)] for i in pred])
+    # 按 majority vote 将 pred 索引映射回真实 domain，再按 domain_color_dict 着色
+    domain_colors = {
+        "BS": "#ff909f",
+        "CNU": "#98d6f9",
+        "FiberTracts": "#cccccc",
+        "HIP": "#7ed04b",
+        "Isocortex": "#1f9d5a",
+        "VS": "#ffcf00",
+    }
+    if labels is not None:
+        uniq = {v: i for i, v in enumerate(sorted(set(labels)))}
+        true_int = np.array([uniq[v] for v in labels], dtype=int)
+        inv = {i: v for v, i in uniq.items()}
+        cm = np.zeros((len(np.unique(pred)), len(np.unique(true_int))), dtype=int)
+        for p, t in zip(pred, true_int):
+            cm[p, t] += 1
+        pred_to_dom = {}
+        for p in range(cm.shape[0]):
+            t_idx = cm[p].argmax()
+            pred_to_dom[p] = inv[t_idx]
+        colors = np.array([domain_colors.get(pred_to_dom.get(p, ""), "#000000") for p in pred])
+    else:
+        # 无真实标签时，按索引循环 6 色
+        palette = list(domain_colors.values())
+        colors = np.array([palette[p % len(palette)] for p in pred])
 
     prot = data.adata.obs.get("protocol-replicate", None)
     unique_prot = prot.unique().tolist() if prot is not None else [None]
@@ -84,10 +106,12 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
         ax.axis("off")
         ax.set_title(str(val))
     # Legend
-    for cls in range(num_classes if num_classes else len(np.unique(pred))):
-        handles.append(plt.Line2D([0], [0], marker='o', color='w', label=str(cls),
-                                  markerfacecolor=palette[cls % len(palette)], markersize=6))
-        labels_legend.append(str(cls))
+    if labels is not None:
+        used_domains = sorted(set(pred_to_dom.values()))
+        for name in used_domains:
+            handles.append(plt.Line2D([0], [0], marker='o', color='w', label=name,
+                                      markerfacecolor=domain_colors.get(name, "#000000"), markersize=6))
+            labels_legend.append(name)
     fig.legend(handles, labels_legend, loc="upper right", bbox_to_anchor=(1.05, 1.05))
     plt.tight_layout()
     plt.savefig(run_dir / out_name, dpi=120)
