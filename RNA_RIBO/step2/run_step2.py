@@ -95,6 +95,8 @@ def train_step2(
     eta_min: Optional[float] = None,
     patience: int = 300,
     min_delta: float = 1e-4,
+    adapter_dim: Optional[int] = None,
+    adapter_dropout: float = 0.0,
     k_spatial: int = 15,
     batch_size: int = 512,
     num_workers: int = 0,
@@ -115,6 +117,8 @@ def train_step2(
                 eta_min=eta_min,
                 patience=patience,
                 min_delta=min_delta,
+                adapter_dim=adapter_dim,
+                adapter_dropout=adapter_dropout,
                 k_spatial=k_spatial,
                 batch_size=batch_size,
                 num_workers=num_workers,
@@ -149,7 +153,13 @@ def train_step2(
     )
 
     # 4) 训练融合模型（全图批次）
-    model = SpatialFusionModel(dim=z_rna.size(1), gcn_hidden=z_rna.size(1), gcn_layers=2).to(device)
+    model = SpatialFusionModel(
+        dim=z_rna.size(1),
+        gcn_hidden=z_rna.size(1),
+        gcn_layers=2,
+        adapter_dim=adapter_dim,
+        adapter_dropout=adapter_dropout,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     if eta_min is None:
         eta_min = lr * 0.1
@@ -254,6 +264,8 @@ def parse_args():
     parser.add_argument("--eta_min", type=float, default=None, help="cosine/plateau 最小 lr，默认 lr*0.1")
     parser.add_argument("--patience", type=int, default=300, help="early stopping 的耐心轮数")
     parser.add_argument("--min_delta", type=float, default=1e-4, help="early stopping 改善阈值")
+    parser.add_argument("--adapter_dim", type=int, default=None, help="Adapter 瓶颈维度，None 表示不启用")
+    parser.add_argument("--adapter_dropout", type=float, default=0.0, help="Adapter dropout")
     parser.add_argument("--k_spatial", type=int, default=15)
     parser.add_argument("--lambda_domain", type=float, default=1)
     parser.add_argument("--batch_size", type=int, default=512, help="提取预训练 embedding 的批大小")
@@ -278,6 +290,8 @@ def main():
         eta_min=args.eta_min,
         patience=args.patience,
         min_delta=args.min_delta,
+        adapter_dim=args.adapter_dim,
+        adapter_dropout=args.adapter_dropout,
         k_spatial=args.k_spatial,
         batch_size=args.batch_size,
         num_workers=args.num_workers,

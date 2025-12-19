@@ -72,6 +72,23 @@ class Decoder(nn.Module):
         return x
 
 
+class Adapter(nn.Module):
+    """简单瓶颈 Adapter，用于将预训练 embedding 适配到单细胞."""
+
+    def __init__(self, dim: int, bottleneck: int, dropout: float = 0.0):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, bottleneck)
+        self.fc2 = nn.Linear(bottleneck, dim)
+        self.dropout = dropout
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.gelu(self.fc1(x))
+        if self.dropout > 0:
+            h = F.dropout(h, p=self.dropout, training=self.training)
+        h = self.fc2(h)
+        return x + h  # 残差
+
+
 def contrastive_nce_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
     """
     对齐 Z_RNA vs Z_Ribo（对称 InfoNCE）。
@@ -142,8 +159,12 @@ class SpatialFusionModel(nn.Module):
         dropout: float = 0.0,
         use_decoder: bool = True,
         temperature: float = 0.07,
+        adapter_dim: Optional[int] = None,
+        adapter_dropout: float = 0.0,
     ):
         super().__init__()
+        self.adapter_rna = Adapter(dim, adapter_dim, adapter_dropout) if adapter_dim else None
+        self.adapter_ribo = Adapter(dim, adapter_dim, adapter_dropout) if adapter_dim else None
         self.fusion = DynamicFusionAttention(dim)
         gcn_dims = [dim] + [gcn_hidden] * (gcn_layers - 1) + [dim]
         self.gcn_blocks = nn.ModuleList(
@@ -164,6 +185,10 @@ class SpatialFusionModel(nn.Module):
         z_ribo: torch.Tensor,
         adj_spatial: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
+        if self.adapter_rna is not None:
+            z_rna = self.adapter_rna(z_rna)
+        if self.adapter_ribo is not None:
+            z_ribo = self.adapter_ribo(z_ribo)
         fused, weights = self.fusion(z_rna, z_ribo)
         h = fused
         for block in self.gcn_blocks:
