@@ -64,8 +64,10 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     x = coords[:, 1] if coords.shape[1] > 1 else coords[:, 0]
     y = -coords[:, 0]
     # 使用对比度更高的调色板（tab10/Set1 等），并添加 legend
-    base_palette = plt.get_cmap("tab10")
-    palette = [base_palette(i) for i in range(num_classes)] if num_classes else [base_palette(i) for i in range(10)]
+    palette = [
+        "#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b",
+        "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
+    ]
     colors = np.array([palette[i % len(palette)] for i in pred])
 
     prot = data.adata.obs.get("protocol-replicate", None)
