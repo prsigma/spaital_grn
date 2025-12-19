@@ -142,11 +142,11 @@ def train_step2(
     # 1) 读取 coords/labels
     data = load_spatial_multiome(str(h5ad_path))
     labels = None
+    num_classes = None
     if data.labels is not None:
-        # 将标签转为连续 id
         uniq = {v: i for i, v in enumerate(sorted(set(data.labels)))}
         labels = torch.tensor([uniq[v] for v in data.labels], dtype=torch.long)
-
+        num_classes = len(uniq)
     # 2) 构建空间邻接
     adj_spatial = build_spatial_knn_graph(data.coords, k=k_spatial)
 
@@ -178,6 +178,7 @@ def train_step2(
         gene_dim=gene_dim,
         w_tx=w_tx,
         w_ribo=w_ribo,
+        num_classes=num_classes,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     if eta_min is None:
@@ -193,6 +194,7 @@ def train_step2(
     z_ribo = z_ribo.to(device)
     adj_spatial = adj_spatial.to(device)
     labels = labels.to(device) if labels is not None else None
+    
 
     log_lines = []
     best_total = float("inf")

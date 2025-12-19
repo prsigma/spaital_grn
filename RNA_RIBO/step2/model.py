@@ -164,6 +164,7 @@ class SpatialFusionModel(nn.Module):
         gene_dim: Optional[int] = None,
         w_tx: Optional[torch.Tensor] = None,
         w_ribo: Optional[torch.Tensor] = None,
+        num_classes: Optional[int] = None,
     ):
         super().__init__()
         self.adapter_rna = Adapter(dim, adapter_dim, adapter_dropout) if adapter_dim else None
@@ -180,6 +181,7 @@ class SpatialFusionModel(nn.Module):
             else:
                 self.tx_proj = None
                 self.ribo_proj = None
+        self.classifier = nn.Linear(dim, num_classes) if num_classes is not None else None
         self.fusion = DynamicFusionAttention(dim)
         gcn_dims = [dim] + [gcn_hidden] * (gcn_layers - 1) + [dim]
         self.gcn_blocks = nn.ModuleList(
@@ -200,19 +202,13 @@ class SpatialFusionModel(nn.Module):
         z_ribo: torch.Tensor,
         adj_spatial: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        if self.use_gene_emb:
-            z_tx_gene = torch.sparse.mm(self.W_tx, self.E_tx) if self.W_tx.is_sparse else self.W_tx @ self.E_tx
-            z_ribo_gene = torch.sparse.mm(self.W_ribo, self.E_ribo) if self.W_ribo.is_sparse else self.W_ribo @ self.E_ribo
-            if self.tx_proj is not None:
-                z_tx_gene = self.tx_proj(z_tx_gene)
-                z_ribo_gene = self.ribo_proj(z_ribo_gene)
-            z_rna = z_rna + z_tx_gene
-            z_ribo = z_ribo + z_ribo_gene
-
-        if self.adapter_rna is not None:
-            z_rna = self.adapter_rna(z_rna)
-        if self.adapter_ribo is not None:
-            z_ribo = self.adapter_ribo(z_ribo)
+        z_tx_gene = torch.sparse.mm(self.W_tx, self.E_tx) if self.W_tx.is_sparse else self.W_tx @ self.E_tx
+        z_ribo_gene = torch.sparse.mm(self.W_ribo, self.E_ribo) if self.W_ribo.is_sparse else self.W_ribo @ self.E_ribo
+        if self.tx_proj is not None:
+            z_tx_gene = self.tx_proj(z_tx_gene)
+            z_ribo_gene = self.ribo_proj(z_ribo_gene)
+        z_rna = self.adapter_rna(z_rna) + z_tx_gene
+        z_ribo = self.adapter_ribo(z_ribo) + z_ribo_gene
         fused, weights = self.fusion(z_rna, z_ribo)
         h = fused
         for block in self.gcn_blocks:
@@ -222,6 +218,8 @@ class SpatialFusionModel(nn.Module):
         if self.use_decoder:
             out["recon_rna"] = self.decoder_rna(h, adj_spatial)
             out["recon_ribo"] = self.decoder_ribo(h, adj_spatial)
+        if self.classifier is not None:
+            out["logits"] = self.classifier(h)
         return out
 
     def compute_losses(
@@ -233,13 +231,13 @@ class SpatialFusionModel(nn.Module):
         labels: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        仅保留域质心约束损失。
+        仅保留分类器域监督损失。
         """
         loss_dict: Dict[str, torch.Tensor] = {}
 
         loss_dict["domain"] = (
-            domain_center_loss(outputs["h_final"], labels)
-            if labels is not None
+            F.cross_entropy(outputs["logits"], labels)
+            if (labels is not None and "logits" in outputs)
             else torch.tensor(0.0, device=z_rna.device)
         )
         total = loss_dict["domain"]

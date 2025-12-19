@@ -52,7 +52,5 @@ def build_starnet_weights(
     s = s_num / (np.sum(s_num, axis=1, keepdims=True) + epsilon)
 
     w = (1 - w_resample) * g + w_resample * s
-    # 行归一确保和为1
-    w = w / (np.sum(w, axis=1, keepdims=True) + epsilon)
 
     return torch.tensor(w, dtype=torch.float32)
