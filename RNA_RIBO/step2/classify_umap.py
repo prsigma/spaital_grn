@@ -72,6 +72,16 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
         "Isocortex": "#1f9d5a",
         "VS": "#ffcf00",
     }
+    domain_colors = {
+        "BS": "#ff909f",
+        "CNU": "#98d6f9",
+        "FiberTracts": "#cccccc",
+        "HIP": "#7ed04b",
+        "Isocortex": "#1f9d5a",
+        "VS": "#ffcf00",
+    }
+
+    pred_to_dom = {}
     if labels is not None:
         uniq = {v: i for i, v in enumerate(sorted(set(labels)))}
         true_int = np.array([uniq[v] for v in labels], dtype=int)
@@ -79,15 +89,15 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
         cm = np.zeros((len(np.unique(pred)), len(np.unique(true_int))), dtype=int)
         for p, t in zip(pred, true_int):
             cm[p, t] += 1
-        pred_to_dom = {}
         for p in range(cm.shape[0]):
             t_idx = cm[p].argmax()
             pred_to_dom[p] = inv[t_idx]
-        colors = np.array([domain_colors.get(pred_to_dom.get(p, ""), "#000000") for p in pred])
-    else:
-        # 无真实标签时，按索引循环 6 色
-        palette = list(domain_colors.values())
-        colors = np.array([palette[p % len(palette)] for p in pred])
+    # 映射颜色；未知/缺失映射的设为灰色
+    colors = []
+    for p in pred:
+        dom = pred_to_dom.get(p)
+        colors.append(domain_colors.get(dom, "#000000"))
+    colors = np.array(colors)
 
     prot = data.adata.obs.get("protocol-replicate", None)
     unique_prot = prot.unique().tolist() if prot is not None else [None]
