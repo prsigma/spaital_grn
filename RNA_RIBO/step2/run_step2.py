@@ -254,16 +254,14 @@ def train_step2(
     model.eval()
     with torch.no_grad():
         outputs = model(z_rna, z_ribo, adj_spatial)
-        fused = outputs["fused"]
         h_final = outputs["h_final"]
         weights = outputs["weights"]
+        pred_classes = torch.argmax(outputs["logits"], dim=1) if "logits" in outputs else None
     torch.save(
         {
-            "fused": fused.cpu(),
             "h_final": h_final.cpu(),
             "weights": weights.cpu(),
-            "z_rna": z_rna.cpu(),
-            "z_ribo": z_ribo.cpu(),
+            "pred_classes": pred_classes.cpu() if pred_classes is not None else None,
             "labels": labels.cpu() if labels is not None else None,
             "best_epoch": best_epoch,
             "best_total": best_total,
