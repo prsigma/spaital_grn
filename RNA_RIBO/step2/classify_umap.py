@@ -20,29 +20,20 @@ from .data import load_spatial_multiome  # noqa: E402
 import scanpy as sc  # noqa: E402
 import debugpy
 
-print("正在启动调试服务器，端口：9999")
-debugpy.listen(9999)
-print("等待调试客户端连接...")
-debugpy.wait_for_client()
-print("调试客户端已连接，继续执行...")
+# print("正在启动调试服务器，端口：9999")
+# debugpy.listen(9999)
+# print("等待调试客户端连接...")
+# debugpy.wait_for_client()
+# print("调试客户端已连接，继续执行...")
 
 
 def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu", out_name: str = "spatial_pred.png"):
     run_dir = Path(run_dir)
     emb = torch.load(run_dir / "embeddings.pt", map_location=device)
-    h_final = emb["h_final"].to(device)
-
-    # 加载 checkpoint 中的分类头参数
-    state = torch.load(run_dir / "model_best.pt", map_location=device)
-    if "classifier.weight" not in state:
-        raise KeyError("model_best.pt 中没有分类头参数 (classifier.weight)")
-    num_classes, dim = state["classifier.weight"].shape
-    classifier = torch.nn.Linear(dim, num_classes)
-    classifier.load_state_dict(
-        {"weight": state["classifier.weight"].to(device), "bias": state["classifier.bias"].to(device)}
-    )
-    classifier.to(device)
-    classifier.eval()
+    pred = emb.get("pred_classes")
+    if pred is None:
+        raise KeyError("embeddings.pt 中不存在 pred_classes，请确认已使用最新训练脚本生成")
+    pred = pred.cpu().numpy()
 
     # 真实标签 + 坐标
     data = load_spatial_multiome(str(h5ad_path))
@@ -50,10 +41,6 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     labels = data.labels  # 保持原始字符串标签
     uniq = {v: i for i, v in enumerate(sorted(set(labels)))} if labels is not None else None
     y_true = np.array([uniq[v] for v in labels], dtype=int) if labels is not None else None
-
-    with torch.no_grad():
-        logits = classifier(h_final)
-        pred = torch.argmax(logits, dim=1).cpu().numpy()
 
     # 评估
     metrics = {}
@@ -92,7 +79,7 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     labels_legend = []
     for ax, val in zip(axes, unique_prot):
         mask = prot == val if prot is not None else np.ones_like(pred, dtype=bool)
-        ax.scatter(x[mask], y[mask], c=colors[mask], s=2.0, alpha=0.8, linewidths=0)
+        ax.scatter(x[mask], y[mask], c=colors[mask], s=6, alpha=1, linewidths=0,marker='o')
         ax.invert_yaxis()
         ax.invert_xaxis()
         ax.axis("off")
