@@ -59,12 +59,12 @@ def classify_with_classifier(run_dir: Path, h5ad_path: Path, device: str = "cpu"
     y = -coords[:, 0]
     # 使用固定的索引->颜色映射
     domain_colors = {
-        5: "#ff909f",
-        0: "#98d6f9",
-        1: "#cccccc",
-        4: "#7ed04b",
-        2: "#1f9d5a",
-        3: "#ffcf00",
+        0: "#ff909f",
+        1: "#98d6f9",
+        2: "#cccccc",
+        3: "#7ed04b",
+        4: "#1f9d5a",
+        5: "#ffcf00",
     }
     colors = np.array([domain_colors.get(int(p), "#000000") for p in pred])
 

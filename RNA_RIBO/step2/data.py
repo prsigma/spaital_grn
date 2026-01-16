@@ -31,7 +31,7 @@ def load_spatial_multiome(
     h5ad_path: str,
     rna_layer: str = "rna_log1p",
     ribo_layer: str = "ribo_log1p",
-    coord_keys: Sequence[str] = ("row", "column", "z"),
+    coord_keys: Sequence[str] = ("row", "column"),
     label_key: Optional[str] = "domain",
 ) -> SpatialMultiOmics:
     """
