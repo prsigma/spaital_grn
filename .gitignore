@@ -1,0 +1,52 @@
+# Editor
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Data / artifacts
+*.h5ad
+*.h5
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.log
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+
+# Large docs
+*.pdf
+
+# Project-specific data/output
+k_3_mult0.5/
+k_5_mult1.0/
+RNA_RIBO/smoothing_umap*/
+RNA_RIBO/step2/runs/
+RNA_RIBO/step2/codebase_report.md/
+RNA_RIBO/step2/patterns_report.json/
+RNA_RIBO/mousebrain_*_with_domain.h5ad
+rna_ribo_layers*.h5ad
+rna_all_converted_wanted_outer*.csv
+ribo_all_converted_wanted_outer*.csv
+scCLIP_ribo/results/
+scCLIP_ribo/data/
+scCLIP_ribo/build/
+scCLIP_ribo/scclip.egg-info/
+scCLIP_ribo/scclip/__pycache__/
+
+# Local planning artifacts
+findings.md
+progress.md
+task_plan.md
+RNA_RIBO/step2/unsupervised_info_needed.md
