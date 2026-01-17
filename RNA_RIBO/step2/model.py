@@ -1,4 +1,4 @@
-"""空间感知的跨模态融合模型（GCN 精炼 + 解码 + 多种损失）。"""
+"""空间感知的跨模态融合模型（无需预训练，端到端训练）。"""
 
 from typing import Dict, Optional, Tuple
 
@@ -7,6 +7,51 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .fusion import DynamicFusionAttention
+
+
+class Encoder(nn.Module):
+    """将原始基因表达编码到低维embedding空间。"""
+
+    def __init__(self, n_genes: int, dim: int, hidden_dim: int = 512, num_layers: int = 2, dropout: float = 0.1):
+        """
+        参数
+        ----
+        n_genes: 基因数量（输入维度）
+        dim: embedding维度（输出维度）
+        hidden_dim: 隐藏层维度
+        num_layers: MLP层数
+        dropout: dropout率
+        """
+        super().__init__()
+        self.n_genes = n_genes
+        self.dim = dim
+
+        # 构建MLP
+        layers = []
+        in_dim = n_genes
+        for i in range(num_layers):
+            out_dim = hidden_dim if i < num_layers - 1 else dim
+            layers.append(nn.Linear(in_dim, out_dim))
+            if i < num_layers - 1:
+                layers.append(nn.LayerNorm(out_dim))
+                layers.append(nn.GELU())
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+            in_dim = out_dim
+
+        self.encoder = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        参数
+        ----
+        x: (N, n_genes) 原始基因表达
+
+        返回
+        ----
+        z: (N, dim) embedding
+        """
+        return self.encoder(x)
 
 
 class GraphConvolution(nn.Module):
@@ -56,9 +101,15 @@ class GCNBlock(nn.Module):
 
 
 class Decoder(nn.Module):
-    """线性+图乘重构（参考 SpatialGlue Decoder）。"""
+    """解码器：从embedding重构回基因表达空间（修复后版本）。"""
 
     def __init__(self, in_dim: int, out_dim: int):
+        """
+        参数
+        ----
+        in_dim: embedding维度（例如128）
+        out_dim: 基因数量（例如1867）- 修复：输出到基因空间
+        """
         super().__init__()
         self.weight = nn.Parameter(torch.empty(in_dim, out_dim))
         self.reset_parameters()
@@ -67,26 +118,19 @@ class Decoder(nn.Module):
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        x = torch.mm(x, self.weight)
-        x = torch.spmm(adj, x)
+        """
+        参数
+        ----
+        x: (N, in_dim) embedding
+        adj: (N, N) 空间邻接矩阵
+
+        返回
+        ----
+        recon: (N, out_dim) 重构的基因表达
+        """
+        x = torch.mm(x, self.weight)  # (N, in_dim) @ (in_dim, out_dim) = (N, out_dim)
+        x = torch.spmm(adj, x)  # (N, N) @ (N, out_dim) = (N, out_dim)
         return x
-
-
-class Adapter(nn.Module):
-    """简单瓶颈 Adapter，用于将预训练 embedding 适配到单细胞."""
-
-    def __init__(self, dim: int, bottleneck: int, dropout: float = 0.0):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, bottleneck)
-        self.fc2 = nn.Linear(bottleneck, dim)
-        self.dropout = dropout
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.gelu(self.fc1(x))
-        if self.dropout > 0:
-            h = F.dropout(h, p=self.dropout, training=self.training)
-        h = self.fc2(h)
-        return x + h  # 残差
 
 
 def contrastive_nce_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
@@ -146,33 +190,62 @@ def link_prediction_loss(
 
 class SpatialFusionModel(nn.Module):
     """
-    融合 + GCN 精炼 + 解码 + 多头损失的总体模型。
+    完整的端到端空间融合模型（无需预训练）。
 
-    输入：预训练得到的 Z_RNA, Z_Ribo 以及空间邻接矩阵 adj_spatial。
+    架构流程：
+    1. 原始表达 → Encoder → embedding
+    2. 可选：+基因embedding（STARNet风格）
+    3. 动态注意力融合
+    4. GCN空间精炼
+    5. Decoder重构 + 分类器
     """
 
     def __init__(
         self,
-        dim: int,
+        n_genes: int,
+        dim: int = 128,
+        encoder_hidden: int = 512,
+        encoder_layers: int = 2,
+        encoder_dropout: float = 0.1,
         gcn_hidden: int = 128,
-        gcn_layers: int = 1,
-        dropout: float = 0.0,
+        gcn_layers: int = 2,
+        gcn_dropout: float = 0.0,
         use_decoder: bool = True,
         temperature: float = 0.07,
-        adapter_dim: Optional[int] = None,
-        adapter_dropout: float = 0.0,
         gene_dim: Optional[int] = None,
         w_tx: Optional[torch.Tensor] = None,
         w_ribo: Optional[torch.Tensor] = None,
-        num_classes: Optional[int] = None,
     ):
+        """
+        参数
+        ----
+        n_genes: 基因数量（输入/输出维度）
+        dim: embedding维度
+        encoder_hidden: encoder隐藏层维度
+        encoder_layers: encoder层数
+        encoder_dropout: encoder dropout率
+        gcn_hidden: GCN隐藏层维度
+        gcn_layers: GCN层数
+        gcn_dropout: GCN dropout率
+        use_decoder: 是否使用decoder重构
+        temperature: 对比损失温度
+        gene_dim: 基因embedding维度（可选，STARNet风格）
+        w_tx: RNA的STARNet权重矩阵 (N_cells, N_genes)
+        w_ribo: RIBO的STARNet权重矩阵
+        """
         super().__init__()
-        self.adapter_rna = Adapter(dim, adapter_dim, adapter_dropout) if adapter_dim else None
-        self.adapter_ribo = Adapter(dim, adapter_dim, adapter_dropout) if adapter_dim else None
+        self.n_genes = n_genes
+        self.dim = dim
+
+        # 编码器：原始表达 → embedding
+        self.encoder_rna = Encoder(n_genes, dim, encoder_hidden, encoder_layers, encoder_dropout)
+        self.encoder_ribo = Encoder(n_genes, dim, encoder_hidden, encoder_layers, encoder_dropout)
+
+        # 可选：基因embedding（STARNet风格）
         self.use_gene_emb = gene_dim is not None and w_tx is not None and w_ribo is not None
         if self.use_gene_emb:
-            self.E_tx = nn.Parameter(torch.randn(w_tx.shape[1], gene_dim))
-            self.E_ribo = nn.Parameter(torch.randn(w_ribo.shape[1], gene_dim))
+            self.E_tx = nn.Parameter(torch.randn(w_tx.shape[1], gene_dim) * 0.01)
+            self.E_ribo = nn.Parameter(torch.randn(w_ribo.shape[1], gene_dim) * 0.01)
             self.register_buffer("W_tx", w_tx)
             self.register_buffer("W_ribo", w_ribo)
             if gene_dim != dim:
@@ -181,66 +254,142 @@ class SpatialFusionModel(nn.Module):
             else:
                 self.tx_proj = None
                 self.ribo_proj = None
-        self.classifier = nn.Linear(dim, num_classes) if num_classes is not None else None
+
+        # 动态注意力融合
         self.fusion = DynamicFusionAttention(dim)
+
+        # GCN空间精炼
         gcn_dims = [dim] + [gcn_hidden] * (gcn_layers - 1) + [dim]
         self.gcn_blocks = nn.ModuleList(
             [
-                GCNBlock(gcn_dims[i], gcn_dims[i + 1], dropout=dropout, activation=F.relu if i < gcn_layers - 1 else None)
+                GCNBlock(
+                    gcn_dims[i],
+                    gcn_dims[i + 1],
+                    dropout=gcn_dropout,
+                    activation=F.relu if i < gcn_layers - 1 else None,
+                )
                 for i in range(gcn_layers)
             ]
         )
+
+        # 解码器：重构回基因表达空间（修复后）
         self.use_decoder = use_decoder
         if use_decoder:
-            self.decoder_rna = Decoder(dim, dim)
-            self.decoder_ribo = Decoder(dim, dim)
+            self.decoder_rna = Decoder(dim, n_genes)  # 输出维度改为n_genes
+            self.decoder_ribo = Decoder(dim, n_genes)
+
         self.temperature = temperature
 
     def forward(
         self,
-        z_rna: torch.Tensor,
-        z_ribo: torch.Tensor,
+        rna_expr: torch.Tensor,
+        ribo_expr: torch.Tensor,
         adj_spatial: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        z_tx_gene = torch.sparse.mm(self.W_tx, self.E_tx) if self.W_tx.is_sparse else self.W_tx @ self.E_tx
-        z_ribo_gene = torch.sparse.mm(self.W_ribo, self.E_ribo) if self.W_ribo.is_sparse else self.W_ribo @ self.E_ribo
-        if self.tx_proj is not None:
-            z_tx_gene = self.tx_proj(z_tx_gene)
-            z_ribo_gene = self.ribo_proj(z_ribo_gene)
-        z_rna = self.adapter_rna(z_rna) + z_tx_gene
-        z_ribo = self.adapter_ribo(z_ribo) + z_ribo_gene
-        fused, weights = self.fusion(z_rna, z_ribo)
+        """
+        参数
+        ----
+        rna_expr: (N, n_genes) 原始RNA表达
+        ribo_expr: (N, n_genes) 原始RIBO表达
+        adj_spatial: (N, N) 空间邻接矩阵（稀疏）
+
+        返回
+        ----
+        outputs: 包含所有中间结果的字典
+        """
+        # 1. 编码：原始表达 → embedding
+        z_rna = self.encoder_rna(rna_expr)  # (N, n_genes) → (N, dim)
+        z_ribo = self.encoder_ribo(ribo_expr)  # (N, n_genes) → (N, dim)
+
+        # 2. 可选：加入基因embedding（STARNet风格）
+        if self.use_gene_emb:
+            z_tx_gene = torch.sparse.mm(self.W_tx, self.E_tx) if self.W_tx.is_sparse else self.W_tx @ self.E_tx
+            z_ribo_gene = torch.sparse.mm(self.W_ribo, self.E_ribo) if self.W_ribo.is_sparse else self.W_ribo @ self.E_ribo
+            if self.tx_proj is not None:
+                z_tx_gene = self.tx_proj(z_tx_gene)
+                z_ribo_gene = self.ribo_proj(z_ribo_gene)
+            z_rna = z_rna + z_tx_gene
+            z_ribo = z_ribo + z_ribo_gene
+
+        # 3. 动态注意力融合
+        fused, weights = self.fusion(z_rna, z_ribo)  # (N, dim), (N, 2)
+
+        # 4. GCN空间精炼
         h = fused
         for block in self.gcn_blocks:
             h = block(h, adj_spatial)
 
-        out = {"fused": fused, "h_final": h, "weights": weights}
+        # 5. 构建输出字典
+        out = {
+            "fused": fused,  # 融合后的特征
+            "h_final": h,  # GCN精炼后的最终embedding
+            "weights": weights,  # 融合权重 [β_RNA, β_Ribo]
+            "z_rna": z_rna,  # RNA embedding（用于对比损失）
+            "z_ribo": z_ribo,  # RIBO embedding（用于对比损失）
+        }
+
+        # 6. 解码器：重构回基因表达空间
         if self.use_decoder:
-            out["recon_rna"] = self.decoder_rna(h, adj_spatial)
-            out["recon_ribo"] = self.decoder_ribo(h, adj_spatial)
-        if self.classifier is not None:
-            out["logits"] = self.classifier(h)
+            out["recon_rna"] = self.decoder_rna(h, adj_spatial)  # (N, n_genes)
+            out["recon_ribo"] = self.decoder_ribo(h, adj_spatial)  # (N, n_genes)
+
         return out
 
     def compute_losses(
         self,
         outputs: Dict[str, torch.Tensor],
-        z_rna: torch.Tensor,
-        z_ribo: torch.Tensor,
+        rna_expr: torch.Tensor,
+        ribo_expr: torch.Tensor,
         adj_spatial: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
+        lambda_recon: float = 1.0,
+        lambda_contrast: float = 0.5,
+        lambda_link: float = 0.2,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        仅保留分类器域监督损失。
+        计算多任务损失（无监督版本）。
+
+        参数
+        ----
+        outputs: forward的输出字典
+        rna_expr: (N, n_genes) 原始RNA表达 - 用于重构损失
+        ribo_expr: (N, n_genes) 原始RIBO表达 - 用于重构损失
+        adj_spatial: (N, N) 空间邻接矩阵
+        lambda_recon: 重构损失权重
+        lambda_contrast: 对比损失权重
+        lambda_link: 链接预测损失权重
+
+        返回
+        ----
+        total_loss: 总损失
+        loss_dict: 各项损失的字典
         """
         loss_dict: Dict[str, torch.Tensor] = {}
 
-        loss_dict["domain"] = (
-            F.cross_entropy(outputs["logits"], labels)
-            if (labels is not None and "logits" in outputs)
-            else torch.tensor(0.0, device=z_rna.device)
+        # 1. 重构损失（修复：目标改为原始表达）
+        if "recon_rna" in outputs and "recon_ribo" in outputs:
+            loss_dict["recon_rna"] = F.mse_loss(outputs["recon_rna"], rna_expr)
+            loss_dict["recon_ribo"] = F.mse_loss(outputs["recon_ribo"], ribo_expr)
+            loss_dict["recon"] = loss_dict["recon_rna"] + loss_dict["recon_ribo"]
+        else:
+            loss_dict["recon"] = torch.tensor(0.0, device=rna_expr.device)
+
+        # 2. 对比损失（修复：现在可以正常训练encoder）
+        if "z_rna" in outputs and "z_ribo" in outputs:
+            loss_dict["contrast"] = contrastive_nce_loss(
+                outputs["z_rna"], outputs["z_ribo"], temperature=self.temperature
+            )
+        else:
+            loss_dict["contrast"] = torch.tensor(0.0, device=rna_expr.device)
+
+        # 3. 链接预测损失（图结构保持）
+        loss_dict["link"] = link_prediction_loss(outputs["h_final"], adj_spatial)
+
+        # 4. 加权总损失
+        total = (
+            lambda_recon * loss_dict["recon"]
+            + lambda_contrast * loss_dict["contrast"]
+            + lambda_link * loss_dict["link"]
         )
-        total = loss_dict["domain"]
         return total, loss_dict
 
 

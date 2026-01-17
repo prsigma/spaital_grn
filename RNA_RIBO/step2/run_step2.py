@@ -1,119 +1,104 @@
 #!/usr/bin/env python
 """
-Step2 训练脚本：载入预训练 CLIP 模型，提取 RNA/Ribo embedding，基于空间图训练融合+GCN 模型。
+Step2 训练脚本：端到端训练空间融合模型（无需预训练）。
 
 用法示例：
-NUMBA_DISABLE_JIT=1 python RNA_RIBO/step2/run_step2.py \\
-  --h5ad RNA_RIBO/smoothing_umap/smoothk15.h5ad \\
-  --ckpt scCLIP_ribo/results/rna_ribo_layers_withlabel/rna_ribo_3.0_True_5000_0.0002_/csv_logs/version_1/checkpoints/best-epoch=243.ckpt \\
-  --out_dir RNA_RIBO/step2/runs/smoothk15 \\
-  --device cuda --epochs 50 --k_spatial 15
+NUMBA_DISABLE_JIT=1 python RNA_RIBO/step2/run_step2.py \
+  --h5ad RNA_RIBO/smoothing_umap/smoothk15.h5ad \
+  --out_dir RNA_RIBO/step2/runs/no_pretrain \
+  --device cuda --epochs 100 --k_spatial 15
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 
-# 把 scCLIP_ribo 包加入路径
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SC_CLIP_ROOT = REPO_ROOT / "scCLIP_ribo"
-if str(SC_CLIP_ROOT) not in sys.path:
-    sys.path.insert(0, str(SC_CLIP_ROOT))
-
-from scclip.clip import CLIPModel  # noqa: E402
-from scclip.data import RnaRiboDataModule  # noqa: E402
-from scclip.vit import ViTConfig  # noqa: E402
-from torch.serialization import add_safe_globals  # noqa: E402
-
-from .data import load_spatial_multiome  # noqa: E402
-from .graph import build_spatial_knn_graph  # noqa: E402
-from .starnet_weights import build_starnet_weights  # noqa: E402
-from .model import SpatialFusionModel  # noqa: E402
-
-
-def extract_embeddings(
-    ckpt_path: Path,
-    h5ad_path: Path,
-    batch_size: int = 512,
-    num_workers: int = 0,
-    device: str = "cuda",
-    rna_layer: str = "rna_log1p",
-    ribo_layer: str = "ribo_log1p",
-):
-    """
-    载入预训练 CLIP，提取全量 RNA/Ribo embedding（对应 rna/ribo 模态）。
-    """
-    add_safe_globals([argparse.Namespace, ViTConfig])  # 兼容 ckpt 中保存的 config
-    # 直接读取 h5ad，使用指定 layer
-    import scanpy as sc
-
-    adata = sc.read_h5ad(h5ad_path)
-    if rna_layer == "X":
-        rna = torch.tensor(adata.X, dtype=torch.float32)
-    else:
-        rna = torch.tensor(adata.layers[rna_layer], dtype=torch.float32)
-    if ribo_layer == "X":
-        ribo = torch.tensor(adata.X, dtype=torch.float32)
-    else:
-        ribo = torch.tensor(adata.layers[ribo_layer], dtype=torch.float32)
-    dataset = TensorDataset(ribo, rna)  # 顺序：ribo -> atac 分支, rna -> rna 分支
-    full_loader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False)
-
-    model = CLIPModel.load_from_checkpoint(str(ckpt_path))
-    model.config.normalize = getattr(model.config, "normalize", True)
-    model = model.to(device)
-    model.eval()
-
-    rna_list, ribo_list = [], []
-    with torch.no_grad():
-        for batch in full_loader:
-            ribo_batch, rna_batch = [x.to(device) for x in batch]
-            ribo_emb, rna_emb = model(ribo_batch, rna_batch)
-            rna_list.append(rna_emb.cpu())
-            ribo_list.append(ribo_emb.cpu())
-
-    z_rna = torch.cat(rna_list, dim=0)
-    z_ribo = torch.cat(ribo_list, dim=0)
-    return z_rna, z_ribo
+from RNA_RIBO.step2.data import load_spatial_multiome  # noqa: E402
+from RNA_RIBO.step2.graph import build_spatial_knn_graph  # noqa: E402
+from RNA_RIBO.step2.starnet_weights import build_starnet_weights  # noqa: E402
+from RNA_RIBO.step2.model import SpatialFusionModel  # noqa: E402
 
 
 def train_step2(
     h5ad_path: Path,
-    ckpt_path: Path,
     out_dir: Path,
     device: str = "cuda",
-    epochs: int = 50,
+    epochs: int = 100,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     scheduler: str = "cosine",
     eta_min: Optional[float] = None,
     patience: int = 300,
     min_delta: float = 1e-4,
-    adapter_dim: Optional[int] = None,
-    adapter_dropout: float = 0.0,
+    # Model architecture
+    dim: int = 128,
+    encoder_hidden: int = 512,
+    encoder_layers: int = 2,
+    encoder_dropout: float = 0.1,
+    gcn_hidden: int = 128,
+    gcn_layers: int = 2,
+    gcn_dropout: float = 0.0,
+    # STARNet gene embedding
     gene_dim: Optional[int] = 128,
     gamma: float = 3.0,
     k_top: int = 30,
     w_resample: float = 0.8,
+    # Spatial graph
     k_spatial: int = 15,
-    batch_size: int = 512,
-    num_workers: int = 0,
+    # Data layers
     rna_layer: str = "rna_log1p",
     ribo_layer: str = "ribo_log1p",
+    # Loss weights
+    lambda_recon: float = 1.0,
+    lambda_contrast: float = 0.5,
+    lambda_link: float = 0.2,
 ):
+    """
+    端到端训练空间融合模型（修复后版本，无需预训练）。
+
+    参数
+    ----
+    h5ad_path: 输入h5ad文件路径
+    out_dir: 输出目录
+    device: 训练设备
+    epochs: 训练轮数
+    lr: 学习率
+    weight_decay: 权重衰减
+    scheduler: 学习率调度器 (cosine/plateau/none)
+    eta_min: 最小学习率
+    patience: early stopping耐心轮数
+    min_delta: early stopping改善阈值
+    dim: embedding维度
+    encoder_hidden: encoder隐藏层维度
+    encoder_layers: encoder层数
+    encoder_dropout: encoder dropout率
+    gcn_hidden: GCN隐藏层维度
+    gcn_layers: GCN层数
+    gcn_dropout: GCN dropout率
+    gene_dim: 基因embedding维度（None则不使用）
+    gamma: STARNet gamma指数
+    k_top: 每个spot选取的基因数
+    w_resample: STARNet混合系数
+    k_spatial: 空间KNN的k值
+    rna_layer: h5ad中RNA layer名称
+    ribo_layer: h5ad中RIBO layer名称
+    lambda_recon: 重构损失权重
+    lambda_contrast: 对比损失权重
+    lambda_link: 链接预测损失权重
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 保存参数
     (out_dir / "args.json").write_text(
         json.dumps(
             dict(
                 h5ad=str(h5ad_path),
-                ckpt=str(ckpt_path),
                 device=device,
                 epochs=epochs,
                 lr=lr,
@@ -122,188 +107,263 @@ def train_step2(
                 eta_min=eta_min,
                 patience=patience,
                 min_delta=min_delta,
-                adapter_dim=adapter_dim,
-                adapter_dropout=adapter_dropout,
+                dim=dim,
+                encoder_hidden=encoder_hidden,
+                encoder_layers=encoder_layers,
+                encoder_dropout=encoder_dropout,
+                gcn_hidden=gcn_hidden,
+                gcn_layers=gcn_layers,
+                gcn_dropout=gcn_dropout,
                 gene_dim=gene_dim,
                 gamma=gamma,
                 k_top=k_top,
                 w_resample=w_resample,
                 k_spatial=k_spatial,
-                batch_size=batch_size,
-                num_workers=num_workers,
                 rna_layer=rna_layer,
                 ribo_layer=ribo_layer,
+                lambda_recon=lambda_recon,
+                lambda_contrast=lambda_contrast,
+                lambda_link=lambda_link,
             ),
             indent=2,
         ),
         encoding="utf-8",
     )
 
-    # 1) 读取 coords/labels
-    data = load_spatial_multiome(str(h5ad_path))
-    labels = None
-    num_classes = None
-    if data.labels is not None:
-        uniq = {v: i for i, v in enumerate(sorted(set(data.labels)))}
-        labels = torch.tensor([uniq[v] for v in data.labels], dtype=torch.long)
-        num_classes = len(uniq)
-    # 2) 构建空间邻接
+    # 1) 加载数据
+    print("Loading data...")
+    data = load_spatial_multiome(str(h5ad_path), rna_layer=rna_layer, ribo_layer=ribo_layer)
+    print(f"Data loaded: {data.rna.shape[0]} cells × {data.rna.shape[1]} genes")
+
+    # 2) 构建空间图
+    print(f"Building spatial KNN graph (k={k_spatial})...")
     adj_spatial = build_spatial_knn_graph(data.coords, k=k_spatial)
 
-    # 3) 提取预训练 embedding
-    z_rna, z_ribo = extract_embeddings(
-        ckpt_path,
-        h5ad_path,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        device=device,
-        rna_layer=rna_layer,
-        ribo_layer=ribo_layer,
-    )
+    # 3) 构建STARNet权重（如果使用基因embedding）
+    w_tx = None
+    w_ribo = None
+    if gene_dim is not None:
+        print(f"Building STARNet weights (gamma={gamma}, k_top={k_top})...")
+        w_tx = build_starnet_weights(data.rna, gamma=gamma, k_top=k_top, w_resample=w_resample)
+        w_ribo = build_starnet_weights(data.ribo, gamma=gamma, k_top=k_top, w_resample=w_resample)
 
-    # 4) 构造 STARNet 权重并初始化基因 embedding
-    w_tx = build_starnet_weights(data.rna, gamma=gamma, k_top=k_top, w_resample=w_resample)
-    w_ribo = build_starnet_weights(data.ribo, gamma=gamma, k_top=k_top, w_resample=w_resample)
-    # 移到 device
-    w_tx = w_tx.to(device)
-    w_ribo = w_ribo.to(device)
+    # 4) 准备训练数据
+    rna_expr = torch.tensor(data.rna, dtype=torch.float32).to(device)
+    ribo_expr = torch.tensor(data.ribo, dtype=torch.float32).to(device)
+    adj_spatial = adj_spatial.to(device)
+    if w_tx is not None:
+        w_tx = w_tx.to(device)
+        w_ribo = w_ribo.to(device)
 
-    # 4) 训练融合模型（全图批次）
+    n_genes = data.rna.shape[1]
+    print(f"Input: RNA {rna_expr.shape}, RIBO {ribo_expr.shape}")
+
+    # 5) 初始化模型
+    print("Initializing model...")
     model = SpatialFusionModel(
-        dim=z_rna.size(1),
-        gcn_hidden=z_rna.size(1),
-        gcn_layers=2,
-        adapter_dim=adapter_dim,
-        adapter_dropout=adapter_dropout,
+        n_genes=n_genes,
+        dim=dim,
+        encoder_hidden=encoder_hidden,
+        encoder_layers=encoder_layers,
+        encoder_dropout=encoder_dropout,
+        gcn_hidden=gcn_hidden,
+        gcn_layers=gcn_layers,
+        gcn_dropout=gcn_dropout,
+        use_decoder=True,
+        temperature=0.07,
         gene_dim=gene_dim,
         w_tx=w_tx,
         w_ribo=w_ribo,
-        num_classes=num_classes,
     ).to(device)
+
+    # 打印模型参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+
+    # 7) 优化器和学习率调度器
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     if eta_min is None:
         eta_min = lr * 0.1
+
     if scheduler == "cosine":
         lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=eta_min)
     elif scheduler == "plateau":
-        lr_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=50, min_lr=eta_min)
+        lr_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=50, min_lr=eta_min
+        )
     else:
         lr_sched = None
 
-    z_rna = z_rna.to(device)
-    z_ribo = z_ribo.to(device)
-    adj_spatial = adj_spatial.to(device)
-    labels = labels.to(device) if labels is not None else None
-    
-
+    # 8) 训练循环
+    print(f"\nStarting training for {epochs} epochs...")
     log_lines = []
     best_total = float("inf")
     best_epoch = -1
     no_improve = 0
     last_best = float("inf")
+
     for epoch in range(1, epochs + 1):
         model.train()
-        outputs = model(z_rna, z_ribo, adj_spatial)
+
+        # Forward pass
+        outputs = model(rna_expr, ribo_expr, adj_spatial)
+
+        # Compute losses
         total_loss, loss_dict = model.compute_losses(
             outputs,
-            z_rna,
-            z_ribo,
+            rna_expr,
+            ribo_expr,
             adj_spatial,
-            labels=labels,
+            lambda_recon=lambda_recon,
+            lambda_contrast=lambda_contrast,
+            lambda_link=lambda_link,
         )
+
+        # Backward pass
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
+
+        # Learning rate scheduling
         if lr_sched is not None:
             if scheduler == "plateau":
                 lr_sched.step(total_loss)
             else:
                 lr_sched.step()
 
+        # Logging
         log = {k: float(v.detach().cpu()) for k, v in loss_dict.items()}
         log["total"] = float(total_loss.detach().cpu())
         log["epoch"] = epoch
+        log["lr"] = optimizer.param_groups[0]["lr"]
         log_lines.append(log)
-        print(f"[epoch {epoch}] " + " ".join(f"{k}={v:.4f}" for k, v in log.items() if k != "epoch"))
+
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"[epoch {epoch}] " + " ".join(f"{k}={v:.4f}" for k, v in log.items() if k not in ["epoch", "lr"]))
+            print(f"  lr={log['lr']:.6f}")
 
         # 保存最新模型
         torch.save(model.state_dict(), out_dir / "model_last.pt")
-        # 保存 best（以总损失为准）
+
+        # 保存最佳模型
         if total_loss.item() < best_total:
             best_total = total_loss.item()
             best_epoch = epoch
             torch.save(model.state_dict(), out_dir / "model_best.pt")
-        # early stopping based on total (domain)
+
+        # Early stopping
         if total_loss.item() + min_delta < last_best:
             last_best = total_loss.item()
             no_improve = 0
         else:
             no_improve += 1
+
         if no_improve >= patience:
-            print(f"Early stopping at epoch {epoch}, best_epoch={best_epoch}, best_total={best_total:.6f}")
+            print(f"\nEarly stopping at epoch {epoch}")
+            print(f"Best epoch: {best_epoch}, Best loss: {best_total:.6f}")
             break
 
-    # 保存日志
-    (out_dir / "losses.jsonl").write_text("\n".join(json.dumps(x) for x in log_lines), encoding="utf-8")
-    # 保存融合 embedding（使用 best 权重，如无则 last）
+    # 9) 保存训练日志为TSV格式
+    if log_lines:
+        # 提取所有列名（保持一致的顺序）
+        columns = ["epoch", "lr", "total"]
+        # 添加各项loss列（按字母顺序排列，方便查看）
+        loss_keys = sorted(set(k for log in log_lines for k in log.keys() if k not in ["epoch", "lr", "total"]))
+        columns.extend(loss_keys)
+
+        # 写入TSV文件
+        with open(out_dir / "losses.tsv", "w", encoding="utf-8") as f:
+            # 写入表头
+            f.write("\t".join(columns) + "\n")
+            # 写入每行数据
+            for log in log_lines:
+                row = [str(log.get(col, "")) for col in columns]
+                f.write("\t".join(row) + "\n")
+
+    # 10) 生成最终embeddings（使用best模型）
+    print("\nGenerating final embeddings...")
     best_path = out_dir / "model_best.pt"
     if best_path.exists():
         model.load_state_dict(torch.load(best_path, map_location=device))
     else:
         model.load_state_dict(torch.load(out_dir / "model_last.pt", map_location=device))
+
     model.eval()
     with torch.no_grad():
-        outputs = model(z_rna, z_ribo, adj_spatial)
+        outputs = model(rna_expr, ribo_expr, adj_spatial)
         h_final = outputs["h_final"]
         weights = outputs["weights"]
-        pred_classes = torch.argmax(outputs["logits"], dim=1) if "logits" in outputs else None
+
     torch.save(
         {
             "h_final": h_final.cpu(),
             "weights": weights.cpu(),
-            "pred_classes": pred_classes.cpu() if pred_classes is not None else None,
-            "labels": labels.cpu() if labels is not None else None,
             "best_epoch": best_epoch,
             "best_total": best_total,
         },
         out_dir / "embeddings.pt",
     )
 
+    print(f"\nTraining complete!")
+    print(f"Best epoch: {best_epoch}")
+    print(f"Best loss: {best_total:.6f}")
+    print(f"Output directory: {out_dir}")
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Step2: spatial fusion training")
-    parser.add_argument("--h5ad", type=str, required=True, help="路径：平滑后的 h5ad，例如 RNA_RIBO/smoothing_umap/smoothk15.h5ad")
-    parser.add_argument("--ckpt", type=str, required=True, help="预训练 CLIP ckpt 路径")
+    parser = argparse.ArgumentParser(description="Step2: 端到端空间融合训练（无需预训练）")
+
+    # Data
+    parser.add_argument("--h5ad", type=str, required=True, help="输入h5ad文件路径")
     parser.add_argument("--out_dir", type=str, default=None, help="输出目录（默认 runs/timestamp）")
+    parser.add_argument("--rna_layer", type=str, default="rna_log1p", help="h5ad中RNA layer，或'X'")
+    parser.add_argument("--ribo_layer", type=str, default="ribo_log1p", help="h5ad中RIBO layer，或'X'")
+
+    # Training
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--epochs", type=int, default=100, help="训练轮数")
+    parser.add_argument("--lr", type=float, default=1e-3, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["cosine", "plateau", "none"])
-    parser.add_argument("--eta_min", type=float, default=None, help="cosine/plateau 最小 lr，默认 lr*0.1")
-    parser.add_argument("--patience", type=int, default=300, help="early stopping 的耐心轮数")
-    parser.add_argument("--min_delta", type=float, default=1e-4, help="early stopping 改善阈值")
-    parser.add_argument("--adapter_dim", type=int, default=None, help="Adapter 瓶颈维度，None 表示不启用")
-    parser.add_argument("--adapter_dropout", type=float, default=0.0, help="Adapter dropout")
-    parser.add_argument("--gene_dim", type=int, default=128, help="基因 embedding 维度，None 关闭基因部分")
-    parser.add_argument("--gamma", type=float, default=3.0, help="STARNet gamma 指数")
-    parser.add_argument("--k_top", type=int, default=30, help="每个 spot 选取的基因数（top-k）")
-    parser.add_argument("--w_resample", type=float, default=0.8, help="STARNet 混合系数")
-    parser.add_argument("--k_spatial", type=int, default=15)
-    parser.add_argument("--lambda_domain", type=float, default=1)
-    parser.add_argument("--batch_size", type=int, default=512, help="提取预训练 embedding 的批大小")
-    parser.add_argument("--num_workers", type=int, default=0, help="提取预训练 embedding 的数据加载线程数")
-    parser.add_argument("--rna_layer", type=str, default="rna_log1p", help="h5ad 中 RNA 使用的 layer，或 'X'")
-    parser.add_argument("--ribo_layer", type=str, default="ribo_log1p", help="h5ad 中 RIBO 使用的 layer，或 'X'")
+    parser.add_argument("--eta_min", type=float, default=None, help="最小lr（默认lr*0.1）")
+    parser.add_argument("--patience", type=int, default=300, help="early stopping耐心")
+    parser.add_argument("--min_delta", type=float, default=1e-4, help="early stopping阈值")
+
+    # Model architecture
+    parser.add_argument("--dim", type=int, default=128, help="Embedding维度")
+    parser.add_argument("--encoder_hidden", type=int, default=512, help="Encoder隐藏层维度")
+    parser.add_argument("--encoder_layers", type=int, default=2, help="Encoder层数")
+    parser.add_argument("--encoder_dropout", type=float, default=0.1, help="Encoder dropout")
+    parser.add_argument("--gcn_hidden", type=int, default=128, help="GCN隐藏层维度")
+    parser.add_argument("--gcn_layers", type=int, default=2, help="GCN层数")
+    parser.add_argument("--gcn_dropout", type=float, default=0.0, help="GCN dropout")
+
+    # STARNet gene embedding
+    parser.add_argument("--gene_dim", type=int, default=128, help="基因embedding维度（None关闭）")
+    parser.add_argument("--gamma", type=float, default=3.0, help="STARNet gamma")
+    parser.add_argument("--k_top", type=int, default=30, help="STARNet top-k基因数")
+    parser.add_argument("--w_resample", type=float, default=0.8, help="STARNet混合系数")
+
+    # Spatial graph
+    parser.add_argument("--k_spatial", type=int, default=15, help="空间KNN的k值")
+
+    # Loss weights
+    parser.add_argument("--lambda_recon", type=float, default=1.0, help="重构损失权重")
+    parser.add_argument("--lambda_contrast", type=float, default=0.5, help="对比损失权重")
+    parser.add_argument("--lambda_link", type=float, default=0.2, help="链接预测损失权重")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    out_dir = Path(args.out_dir) if args.out_dir else Path("RNA_RIBO/step2/runs") / datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = (
+        Path(args.out_dir) if args.out_dir else Path("RNA_RIBO/step2/runs") / datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
+
     train_step2(
         h5ad_path=Path(args.h5ad),
-        ckpt_path=Path(args.ckpt),
         out_dir=out_dir,
         device=args.device,
         epochs=args.epochs,
@@ -313,13 +373,23 @@ def main():
         eta_min=args.eta_min,
         patience=args.patience,
         min_delta=args.min_delta,
-        adapter_dim=args.adapter_dim,
-        adapter_dropout=args.adapter_dropout,
+        dim=args.dim,
+        encoder_hidden=args.encoder_hidden,
+        encoder_layers=args.encoder_layers,
+        encoder_dropout=args.encoder_dropout,
+        gcn_hidden=args.gcn_hidden,
+        gcn_layers=args.gcn_layers,
+        gcn_dropout=args.gcn_dropout,
+        gene_dim=args.gene_dim,
+        gamma=args.gamma,
+        k_top=args.k_top,
+        w_resample=args.w_resample,
         k_spatial=args.k_spatial,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
         rna_layer=args.rna_layer,
         ribo_layer=args.ribo_layer,
+        lambda_recon=args.lambda_recon,
+        lambda_contrast=args.lambda_contrast,
+        lambda_link=args.lambda_link,
     )
 
 
