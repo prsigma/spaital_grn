@@ -17,12 +17,24 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
+import random
+import numpy as np
 import torch
 
 from RNA_RIBO.step2.data import load_spatial_multiome  # noqa: E402
 from RNA_RIBO.step2.graph import build_spatial_knn_graph  # noqa: E402
 from RNA_RIBO.step2.starnet_weights import build_starnet_weights  # noqa: E402
 from RNA_RIBO.step2.model import SpatialFusionModel  # noqa: E402
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def train_step2(
@@ -58,6 +70,9 @@ def train_step2(
     lambda_recon: float = 1.0,
     lambda_contrast: float = 0.5,
     lambda_link: float = 0.2,
+    # Eval
+    eval_every: int = 10,
+    seed: int = 42,
 ):
     """
     端到端训练空间融合模型（修复后版本，无需预训练）。
@@ -91,8 +106,11 @@ def train_step2(
     lambda_recon: 重构损失权重
     lambda_contrast: 对比损失权重
     lambda_link: 链接预测损失权重
+    eval_every: 每隔多少epoch做一次评估（<=0关闭）
+    seed: 随机种子
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(seed)
 
     # 保存参数
     (out_dir / "args.json").write_text(
@@ -124,6 +142,8 @@ def train_step2(
                 lambda_recon=lambda_recon,
                 lambda_contrast=lambda_contrast,
                 lambda_link=lambda_link,
+                eval_every=eval_every,
+                seed=seed,
             ),
             indent=2,
         ),
@@ -157,6 +177,14 @@ def train_step2(
 
     n_genes = data.rna.shape[1]
     print(f"Input: RNA {rna_expr.shape}, RIBO {ribo_expr.shape}")
+
+    labels = data.labels
+    y_true = None
+    n_clusters = None
+    if labels is not None:
+        uniq = {v: i for i, v in enumerate(sorted(set(labels)))}
+        y_true = np.array([uniq[v] for v in labels], dtype=int)
+        n_clusters = len(np.unique(y_true))
 
     # 5) 初始化模型
     print("Initializing model...")
@@ -202,6 +230,9 @@ def train_step2(
     best_epoch = -1
     no_improve = 0
     last_best = float("inf")
+    best_ari = -1.0
+    best_ari_epoch = -1
+    eval_lines = []
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -243,6 +274,143 @@ def train_step2(
             print(f"[epoch {epoch}] " + " ".join(f"{k}={v:.4f}" for k, v in log.items() if k not in ["epoch", "lr"]))
             print(f"  lr={log['lr']:.6f}")
 
+        # 评估（沿用 classify_umap 的聚类与指标计算逻辑，不改聚类方法）
+        if eval_every > 0 and y_true is not None and (epoch % eval_every == 0 or epoch == 1):
+            model.eval()
+            with torch.no_grad():
+                eval_outputs = model(rna_expr, ribo_expr, adj_spatial)
+                h_final_eval = eval_outputs["h_final"]
+
+            from sklearn.cluster import KMeans
+            from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, homogeneity_completeness_v_measure
+
+            pred = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit_predict(
+                h_final_eval.cpu().numpy()
+            )
+            ari = adjusted_rand_score(y_true, pred)
+            nmi = normalized_mutual_info_score(y_true, pred)
+            h, c, v = homogeneity_completeness_v_measure(y_true, pred)
+            eval_metrics = {
+                "epoch": epoch,
+                "ARI": ari,
+                "NMI": nmi,
+                "homogeneity": h,
+                "completeness": c,
+                "v": v,
+            }
+            eval_lines.append(eval_metrics)
+            print(f"[eval {epoch}] ARI={ari:.4f} NMI={nmi:.4f}")
+
+            if ari > best_ari:
+                best_ari = ari
+                best_ari_epoch = epoch
+                torch.save(model.state_dict(), out_dir / "model_best_ari.pt")
+                torch.save(
+                    {
+                        "h_final": h_final_eval.cpu(),
+                        "pred_classes": torch.tensor(pred),
+                        "epoch": epoch,
+                        "metrics": eval_metrics,
+                    },
+                    out_dir / "embeddings_best_ari.pt",
+                )
+
+                import matplotlib
+
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+
+                adata = data.adata
+                labels = adata.obs["domain"].to_numpy() if "domain" in adata.obs else None
+
+                def _resolve_coord_key(key: str):
+                    obs = adata.obs
+                    if key in obs:
+                        return key
+                    if key == "columns" and "column" in obs:
+                        return "column"
+                    if key == "column" and "columns" in obs:
+                        return "columns"
+                    if key == "rows" and "row" in obs:
+                        return "row"
+                    if key == "row" and "rows" in obs:
+                        return "rows"
+                    raise KeyError(f"Coordinate column '{key}' not found in obs")
+
+                def _label_colors(values, cmap_name="tab20"):
+                    uniq_vals = sorted(set(values))
+                    cmap = plt.get_cmap(cmap_name, len(uniq_vals))
+                    color_map = {v: cmap(i) for i, v in enumerate(uniq_vals)}
+                    return np.array([color_map[v] for v in values])
+
+                key_x = _resolve_coord_key("column")
+                key_y = _resolve_coord_key("row")
+                x = adata.obs[key_x].to_numpy()
+                y = -adata.obs[key_y].to_numpy()
+
+                if labels is not None:
+                    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+                    axes[0].scatter(x, y, c=_label_colors(labels), s=6, alpha=1, linewidths=0, marker="o")
+                    axes[0].invert_yaxis()
+                    axes[0].invert_xaxis()
+                    axes[0].axis("off")
+                    axes[0].set_title("domain")
+
+                    axes[1].scatter(x, y, c=_label_colors(pred), s=6, alpha=1, linewidths=0, marker="o")
+                    axes[1].invert_yaxis()
+                    axes[1].invert_xaxis()
+                    axes[1].axis("off")
+                    axes[1].set_title("pred")
+
+                    plt.tight_layout()
+                    plt.savefig(out_dir / "spatial_domain_vs_pred_best_ari.png", dpi=150)
+                    plt.close()
+
+                domain_colors = {
+                    0: "#ff909f",
+                    1: "#98d6f9",
+                    2: "#cccccc",
+                    3: "#7ed04b",
+                    4: "#1f9d5a",
+                    5: "#ffcf00",
+                }
+                colors = np.array([domain_colors.get(int(p), "#000000") for p in pred])
+
+                prot = adata.obs.get("protocol-replicate", None)
+                unique_prot = prot.unique().tolist() if prot is not None else [None]
+
+                n_cols = len(unique_prot)
+                fig, axes = plt.subplots(1, n_cols, figsize=(8.4 * n_cols, 8.14))
+                if n_cols == 1:
+                    axes = [axes]
+                handles = []
+                labels_legend = []
+                for ax, val in zip(axes, unique_prot):
+                    mask = prot == val if prot is not None else np.ones_like(pred, dtype=bool)
+                    ax.scatter(x[mask], y[mask], c=colors[mask], s=6, alpha=1, linewidths=0, marker="o")
+                    ax.invert_yaxis()
+                    ax.invert_xaxis()
+                    ax.axis("off")
+                    ax.set_title(str(val))
+                used_preds = sorted(set(pred))
+                for cls in used_preds:
+                    handles.append(
+                        plt.Line2D(
+                            [0],
+                            [0],
+                            marker="o",
+                            color="w",
+                            label=str(cls),
+                            markerfacecolor=domain_colors.get(int(cls), "#000000"),
+                            markersize=6,
+                        )
+                    )
+                    labels_legend.append(str(cls))
+                fig.legend(handles, labels_legend, loc="upper right", bbox_to_anchor=(1.05, 1.05))
+                plt.tight_layout()
+                plt.savefig(out_dir / "spatial_pred_best_ari.png", dpi=120)
+                plt.close()
+
         # 保存最新模型
         torch.save(model.state_dict(), out_dir / "model_last.pt")
 
@@ -281,6 +449,14 @@ def train_step2(
                 row = [str(log.get(col, "")) for col in columns]
                 f.write("\t".join(row) + "\n")
 
+    if eval_lines:
+        eval_columns = ["epoch", "ARI", "NMI", "homogeneity", "completeness", "v"]
+        with open(out_dir / "eval_metrics.tsv", "w", encoding="utf-8") as f:
+            f.write("\t".join(eval_columns) + "\n")
+            for log in eval_lines:
+                row = [str(log.get(col, "")) for col in eval_columns]
+                f.write("\t".join(row) + "\n")
+
     # 10) 生成最终embeddings（使用best模型）
     print("\nGenerating final embeddings...")
     best_path = out_dir / "model_best.pt"
@@ -308,6 +484,9 @@ def train_step2(
     print(f"\nTraining complete!")
     print(f"Best epoch: {best_epoch}")
     print(f"Best loss: {best_total:.6f}")
+    if best_ari_epoch >= 0:
+        print(f"Best ARI epoch: {best_ari_epoch}")
+        print(f"Best ARI: {best_ari:.6f}")
     print(f"Output directory: {out_dir}")
 
 
@@ -352,6 +531,8 @@ def parse_args():
     parser.add_argument("--lambda_recon", type=float, default=1.0, help="重构损失权重")
     parser.add_argument("--lambda_contrast", type=float, default=0.5, help="对比损失权重")
     parser.add_argument("--lambda_link", type=float, default=0.2, help="链接预测损失权重")
+    parser.add_argument("--eval_every", type=int, default=10, help="每隔多少epoch做一次评估（<=0关闭）")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
 
     return parser.parse_args()
 
@@ -390,6 +571,8 @@ def main():
         lambda_recon=args.lambda_recon,
         lambda_contrast=args.lambda_contrast,
         lambda_link=args.lambda_link,
+        eval_every=args.eval_every,
+        seed=args.seed,
     )
 
 

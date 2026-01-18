@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-使用 embeddings.pt 中的 h_final 和 best checkpoint 中的分类头进行预测，并绘制 UMAP。
+使用 embeddings_best_ari.pt 中的 h_final 和 best checkpoint 中的分类头进行预测，并绘制 UMAP。
 不重新前向传播/重建图，只取已有 h_final 输入分类头。
 """
 
@@ -38,7 +38,7 @@ def classify_with_classifier(
     coord_y: str = "row",
 ):
     run_dir = Path(run_dir)
-    emb = torch.load(run_dir / "embeddings.pt", map_location=device)
+    emb = torch.load(run_dir / "embeddings_best_ari.pt", map_location=device)
     adata = ad.read_h5ad(h5ad_path, backed="r")
     labels = adata.obs["domain"].to_numpy() if "domain" in adata.obs else None
     uniq = {v: i for i, v in enumerate(sorted(set(labels)))} if labels is not None else None
@@ -47,7 +47,7 @@ def classify_with_classifier(
     if pred is None:
         h_final = emb.get("h_final")
         if h_final is None:
-            raise KeyError("embeddings.pt 中不存在 pred_classes 或 h_final，请确认训练输出")
+            raise KeyError("embeddings_best_ari.pt 中不存在 pred_classes 或 h_final，请确认训练输出")
         if n_clusters is None:
             if y_true is None:
                 raise ValueError("未提供真实标签，需显式指定 --n_clusters")
@@ -93,22 +93,62 @@ def classify_with_classifier(
     y = adata.obs[key_y].to_numpy()
     y = -y
 
-    def _label_colors(values, cmap_name="tab20"):
-        uniq_vals = sorted(set(values))
-        cmap = plt.get_cmap(cmap_name, len(uniq_vals))
-        color_map = {v: cmap(i) for i, v in enumerate(uniq_vals)}
-        return np.array([color_map[v] for v in values])
+    def _label_colors(values, color_map):
+        return np.array([color_map.get(v, "#000000") for v in values])
 
-    # 生成 domain vs pred 的空间对比图
+    domain_colors = {
+        0: "#ff909f",
+        1: "#98d6f9",
+        2: "#cccccc",
+        3: "#7ed04b",
+        4: "#1f9d5a",
+        5: "#ffcf00",
+    }
+    domain_color_dict = {
+        "BS": "#ff909f",
+        "CNU": "#98d6f9",
+        "FiberTracts": "#cccccc",
+        "HIP": "#7ed04b",
+        "Isocortex": "#1f9d5a",
+        "VS": "#ffcf00",
+    }
+    domain_label_colors = domain_colors
+    if labels is not None:
+        has_str = any(isinstance(v, str) for v in labels)
+        domain_label_colors = domain_color_dict if has_str else domain_colors
+        from collections import Counter
+
+        pred_to_domain = {}
+        for cls in sorted(set(pred)):
+            mask = pred == cls
+            if not np.any(mask):
+                continue
+            pred_to_domain[cls] = Counter(labels[mask]).most_common(1)[0][0]
+        pred_labels_for_color = np.array([pred_to_domain.get(c) for c in pred], dtype=object)
+    else:
+        pred_to_domain = {}
+        pred_labels_for_color = pred
+
+    # 生成 domain vs pred 的空间对比图（使用固定颜色映射）
     if labels is not None:
         fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-        axes[0].scatter(x, y, c=_label_colors(labels), s=6, alpha=1, linewidths=0, marker="o")
+        axes[0].scatter(
+            x,
+            y,
+            c=_label_colors(labels, domain_label_colors),
+            s=6,
+            alpha=1,
+            linewidths=0,
+            marker="o",
+        )
         axes[0].invert_yaxis()
         axes[0].invert_xaxis()
         axes[0].axis("off")
         axes[0].set_title("domain")
 
-        axes[1].scatter(x, y, c=_label_colors(pred), s=6, alpha=1, linewidths=0, marker="o")
+        axes[1].scatter(
+            x, y, c=_label_colors(pred_labels_for_color, domain_label_colors), s=6, alpha=1, linewidths=0, marker="o"
+        )
         axes[1].invert_yaxis()
         axes[1].invert_xaxis()
         axes[1].axis("off")
@@ -118,17 +158,9 @@ def classify_with_classifier(
         plt.savefig(run_dir / out_compare, dpi=150)
         plt.close()
 
-    # 空间坐标着色（按 protocol-replicate 拆分左右子图）
+    # 空间坐标着色（按 protocol-replicate 拆分左右子图）n
     # 使用固定的索引->颜色映射
-    domain_colors = {
-        0: "#ff909f",
-        1: "#98d6f9",
-        2: "#cccccc",
-        3: "#7ed04b",
-        4: "#1f9d5a",
-        5: "#ffcf00",
-    }
-    colors = np.array([domain_colors.get(int(p), "#000000") for p in pred])
+    colors = _label_colors(pred_labels_for_color, domain_label_colors)
 
     prot = adata.obs.get("protocol-replicate", None)
     unique_prot = prot.unique().tolist() if prot is not None else [None]
@@ -146,12 +178,37 @@ def classify_with_classifier(
         ax.invert_xaxis()
         ax.axis("off")
         ax.set_title(str(val))
-    # Legend: 使用固定索引标签
-    used_preds = sorted(set(pred))
-    for cls in used_preds:
-        handles.append(plt.Line2D([0], [0], marker='o', color='w', label=str(cls),
-                                  markerfacecolor=domain_colors.get(int(cls), "#000000"), markersize=6))
-        labels_legend.append(str(cls))
+    # Legend: 仅显示 domain 标签
+    if labels is not None:
+        used_domains = sorted(set(labels))
+        for lab in used_domains:
+            handles.append(
+                plt.Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=str(lab),
+                    markerfacecolor=domain_label_colors.get(lab, "#000000"),
+                    markersize=6,
+                )
+            )
+            labels_legend.append(str(lab))
+    else:
+        used_preds = sorted(set(pred))
+        for cls in used_preds:
+            handles.append(
+                plt.Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    label=str(cls),
+                    markerfacecolor=domain_label_colors.get(cls, "#000000"),
+                    markersize=6,
+                )
+            )
+            labels_legend.append(str(cls))
     fig.legend(handles, labels_legend, loc="upper right", bbox_to_anchor=(1.05, 1.05))
     plt.tight_layout()
     plt.savefig(run_dir / out_name, dpi=120)
@@ -162,7 +219,7 @@ def classify_with_classifier(
 
 def main():
     parser = argparse.ArgumentParser(description="Classify using h_final and classifier head from best checkpoint.")
-    parser.add_argument("--run_dir", required=True, type=str, help="包含 model_best.pt / embeddings.pt 的目录")
+    parser.add_argument("--run_dir", required=True, type=str, help="包含 model_best.pt / embeddings_best_ari.pt 的目录")
     parser.add_argument("--h5ad", required=True, type=str, help="原始 h5ad（需含 domain 和 UMAP/可重算）")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--out_name", type=str, default="umap_pred.png")
