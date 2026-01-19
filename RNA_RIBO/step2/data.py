@@ -32,7 +32,7 @@ def load_spatial_multiome(
     rna_layer: str = "rna_log1p",
     ribo_layer: str = "ribo_log1p",
     coord_keys: Sequence[str] = ("row", "column"),
-    label_key: Optional[str] = "domain",
+    label_key: Optional[str] = "rna_nn_alg1_label2",
 ) -> SpatialMultiOmics:
     """
     Load RNA/Ribo modalities plus coordinates/labels from an h5ad file.

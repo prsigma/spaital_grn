@@ -19,6 +19,15 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import anndata as ad  # noqa: E402
 
+domain_colors = {
+    0: "#ff909f",
+    1: "#98d6f9",
+    2: "#cccccc",
+    3: "#7ed04b",
+    4: "#1f9d5a",
+    5: "#ffcf00",
+}
+
 # print("正在启动调试服务器，端口：9999")
 # debugpy.listen(9999)
 # print("等待调试客户端连接...")
@@ -40,26 +49,24 @@ def classify_with_classifier(
     run_dir = Path(run_dir)
     emb = torch.load(run_dir / "embeddings_best_ari.pt", map_location=device)
     adata = ad.read_h5ad(h5ad_path, backed="r")
-    labels = adata.obs["domain"].to_numpy() if "domain" in adata.obs else None
+    labels = adata.obs["rna_nn_alg1_label2"].to_numpy() if "rna_nn_alg1_label2" in adata.obs else None
     uniq = {v: i for i, v in enumerate(sorted(set(labels)))} if labels is not None else None
     y_true = np.array([uniq[v] for v in labels], dtype=int) if labels is not None else None
-    pred = emb.get("pred_classes")
-    if pred is None:
-        h_final = emb.get("h_final")
-        if h_final is None:
-            raise KeyError("embeddings_best_ari.pt 中不存在 pred_classes 或 h_final，请确认训练输出")
-        if n_clusters is None:
-            if y_true is None:
-                raise ValueError("未提供真实标签，需显式指定 --n_clusters")
-            n_clusters = len(np.unique(y_true))
-        if cluster_method == "kmeans":
-            from sklearn.cluster import KMeans
+    
+    h_final = emb.get("h_final")
+    if h_final is None:
+        raise KeyError("embeddings_best_ari.pt 中不存在 pred_classes 或 h_final，请确认训练输出")
+    if y_true is None:
+        raise ValueError("未提供真实标签，需显式指定 --n_clusters")
+    n_clusters = len(np.unique(y_true))
+    print(n_clusters)
+    if cluster_method == "kmeans":
+        from sklearn.cluster import KMeans
 
-            pred = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit_predict(h_final.cpu().numpy())
-        else:
-            raise ValueError(f"Unsupported cluster_method: {cluster_method}")
+        pred = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit_predict(h_final.cpu().numpy())
     else:
-        pred = pred.cpu().numpy()
+        raise ValueError(f"Unsupported cluster_method: {cluster_method}")
+    
 
     # 评估
     metrics = {}
@@ -96,38 +103,19 @@ def classify_with_classifier(
     def _label_colors(values, color_map):
         return np.array([color_map.get(v, "#000000") for v in values])
 
-    domain_colors = {
-        0: "#ff909f",
-        1: "#98d6f9",
-        2: "#cccccc",
-        3: "#7ed04b",
-        4: "#1f9d5a",
-        5: "#ffcf00",
-    }
-    domain_color_dict = {
-        "BS": "#ff909f",
-        "CNU": "#98d6f9",
-        "FiberTracts": "#cccccc",
-        "HIP": "#7ed04b",
-        "Isocortex": "#1f9d5a",
-        "VS": "#ffcf00",
-    }
     domain_label_colors = domain_colors
     if labels is not None:
         has_str = any(isinstance(v, str) for v in labels)
-        domain_label_colors = domain_color_dict if has_str else domain_colors
-        from collections import Counter
+        if has_str:
+            uniq_labels = sorted(set(labels))
+            cmap = plt.get_cmap("tab20", len(uniq_labels))
+            domain_label_colors = {lab: cmap(i) for i, lab in enumerate(uniq_labels)}
+        else:
+            domain_label_colors = domain_colors
 
-        pred_to_domain = {}
-        for cls in sorted(set(pred)):
-            mask = pred == cls
-            if not np.any(mask):
-                continue
-            pred_to_domain[cls] = Counter(labels[mask]).most_common(1)[0][0]
-        pred_labels_for_color = np.array([pred_to_domain.get(c) for c in pred], dtype=object)
-    else:
-        pred_to_domain = {}
-        pred_labels_for_color = pred
+    uniq_pred = sorted(set(pred))
+    cmap_pred = plt.get_cmap("tab20", len(uniq_pred))
+    pred_color_map = {cls: cmap_pred(i) for i, cls in enumerate(uniq_pred)}
 
     # 生成 domain vs pred 的空间对比图（使用固定颜色映射）
     if labels is not None:
@@ -147,7 +135,7 @@ def classify_with_classifier(
         axes[0].set_title("domain")
 
         axes[1].scatter(
-            x, y, c=_label_colors(pred_labels_for_color, domain_label_colors), s=6, alpha=1, linewidths=0, marker="o"
+            x, y, c=_label_colors(pred, pred_color_map), s=6, alpha=1, linewidths=0, marker="o"
         )
         axes[1].invert_yaxis()
         axes[1].invert_xaxis()
@@ -160,7 +148,7 @@ def classify_with_classifier(
 
     # 空间坐标着色（按 protocol-replicate 拆分左右子图）n
     # 使用固定的索引->颜色映射
-    colors = _label_colors(pred_labels_for_color, domain_label_colors)
+    colors = _label_colors(pred, pred_color_map)
 
     prot = adata.obs.get("protocol-replicate", None)
     unique_prot = prot.unique().tolist() if prot is not None else [None]
@@ -194,9 +182,8 @@ def classify_with_classifier(
                 )
             )
             labels_legend.append(str(lab))
-    else:
-        used_preds = sorted(set(pred))
-        for cls in used_preds:
+    elif pred is not None:
+        for cls in uniq_pred:
             handles.append(
                 plt.Line2D(
                     [0],
@@ -204,7 +191,7 @@ def classify_with_classifier(
                     marker="o",
                     color="w",
                     label=str(cls),
-                    markerfacecolor=domain_label_colors.get(cls, "#000000"),
+                    markerfacecolor=pred_color_map.get(cls, "#000000"),
                     markersize=6,
                 )
             )

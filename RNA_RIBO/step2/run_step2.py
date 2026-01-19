@@ -321,7 +321,7 @@ def train_step2(
                 import matplotlib.pyplot as plt
 
                 adata = data.adata
-                labels = adata.obs["domain"].to_numpy() if "domain" in adata.obs else None
+                labels = adata.obs["rna_nn_alg1_label"].to_numpy() if "rna_nn_alg1_label" in adata.obs else None
 
                 def _resolve_coord_key(key: str):
                     obs = adata.obs
@@ -337,26 +337,49 @@ def train_step2(
                         return "rows"
                     raise KeyError(f"Coordinate column '{key}' not found in obs")
 
-                def _label_colors(values, cmap_name="tab20"):
-                    uniq_vals = sorted(set(values))
-                    cmap = plt.get_cmap(cmap_name, len(uniq_vals))
-                    color_map = {v: cmap(i) for i, v in enumerate(uniq_vals)}
-                    return np.array([color_map[v] for v in values])
+                def _label_colors(values, color_map):
+                    return np.array([color_map.get(v, "#000000") for v in values])
 
                 key_x = _resolve_coord_key("column")
                 key_y = _resolve_coord_key("row")
                 x = adata.obs[key_x].to_numpy()
                 y = -adata.obs[key_y].to_numpy()
 
+                domain_label_colors = {}
+                if labels is not None:
+                    uniq_labels = sorted(set(labels))
+                    cmap = plt.get_cmap("tab20", len(uniq_labels))
+                    domain_label_colors = {lab: cmap(i) for i, lab in enumerate(uniq_labels)}
+
+                uniq_pred = sorted(set(pred))
+                cmap_pred = plt.get_cmap("tab20", len(uniq_pred))
+                pred_color_map = {cls: cmap_pred(i) for i, cls in enumerate(uniq_pred)}
+
                 if labels is not None:
                     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-                    axes[0].scatter(x, y, c=_label_colors(labels), s=6, alpha=1, linewidths=0, marker="o")
+                    axes[0].scatter(
+                        x,
+                        y,
+                        c=_label_colors(labels, domain_label_colors),
+                        s=6,
+                        alpha=1,
+                        linewidths=0,
+                        marker="o",
+                    )
                     axes[0].invert_yaxis()
                     axes[0].invert_xaxis()
                     axes[0].axis("off")
-                    axes[0].set_title("domain")
+                    axes[0].set_title("rna_nn_alg1_label")
 
-                    axes[1].scatter(x, y, c=_label_colors(pred), s=6, alpha=1, linewidths=0, marker="o")
+                    axes[1].scatter(
+                        x,
+                        y,
+                        c=_label_colors(pred, pred_color_map),
+                        s=6,
+                        alpha=1,
+                        linewidths=0,
+                        marker="o",
+                    )
                     axes[1].invert_yaxis()
                     axes[1].invert_xaxis()
                     axes[1].axis("off")
@@ -366,15 +389,7 @@ def train_step2(
                     plt.savefig(out_dir / "spatial_domain_vs_pred_best_ari.png", dpi=150)
                     plt.close()
 
-                domain_colors = {
-                    0: "#ff909f",
-                    1: "#98d6f9",
-                    2: "#cccccc",
-                    3: "#7ed04b",
-                    4: "#1f9d5a",
-                    5: "#ffcf00",
-                }
-                colors = np.array([domain_colors.get(int(p), "#000000") for p in pred])
+                colors = _label_colors(pred, pred_color_map)
 
                 prot = adata.obs.get("protocol-replicate", None)
                 unique_prot = prot.unique().tolist() if prot is not None else [None]
@@ -392,20 +407,35 @@ def train_step2(
                     ax.invert_xaxis()
                     ax.axis("off")
                     ax.set_title(str(val))
-                used_preds = sorted(set(pred))
-                for cls in used_preds:
-                    handles.append(
-                        plt.Line2D(
-                            [0],
-                            [0],
-                            marker="o",
-                            color="w",
-                            label=str(cls),
-                            markerfacecolor=domain_colors.get(int(cls), "#000000"),
-                            markersize=6,
+                if labels is not None:
+                    uniq_labels = sorted(set(labels))
+                    for lab in uniq_labels:
+                        handles.append(
+                            plt.Line2D(
+                                [0],
+                                [0],
+                                marker="o",
+                                color="w",
+                                label=str(lab),
+                                markerfacecolor=domain_label_colors.get(lab, "#000000"),
+                                markersize=6,
+                            )
                         )
-                    )
-                    labels_legend.append(str(cls))
+                        labels_legend.append(str(lab))
+                else:
+                    for cls in uniq_pred:
+                        handles.append(
+                            plt.Line2D(
+                                [0],
+                                [0],
+                                marker="o",
+                                color="w",
+                                label=str(cls),
+                                markerfacecolor=pred_color_map.get(cls, "#000000"),
+                                markersize=6,
+                            )
+                        )
+                        labels_legend.append(str(cls))
                 fig.legend(handles, labels_legend, loc="upper right", bbox_to_anchor=(1.05, 1.05))
                 plt.tight_layout()
                 plt.savefig(out_dir / "spatial_pred_best_ari.png", dpi=120)
