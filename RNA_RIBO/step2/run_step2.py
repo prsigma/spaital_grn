@@ -66,6 +66,7 @@ def train_step2(
     # Data layers
     rna_layer: str = "rna_log1p",
     ribo_layer: str = "ribo_log1p",
+    cell_id_key: str = "cell_id",
     # Loss weights
     lambda_recon: float = 1.0,
     lambda_contrast: float = 0.5,
@@ -103,6 +104,7 @@ def train_step2(
     k_spatial: 空间KNN的k值
     rna_layer: h5ad中RNA layer名称
     ribo_layer: h5ad中RIBO layer名称
+    cell_id_key: h5ad中显式 cell id 列名（缺失时报错）
     lambda_recon: 重构损失权重
     lambda_contrast: 对比损失权重
     lambda_link: 链接预测损失权重
@@ -139,6 +141,7 @@ def train_step2(
                 k_spatial=k_spatial,
                 rna_layer=rna_layer,
                 ribo_layer=ribo_layer,
+                cell_id_key=cell_id_key,
                 lambda_recon=lambda_recon,
                 lambda_contrast=lambda_contrast,
                 lambda_link=lambda_link,
@@ -152,7 +155,12 @@ def train_step2(
 
     # 1) 加载数据
     print("Loading data...")
-    data = load_spatial_multiome(str(h5ad_path), rna_layer=rna_layer, ribo_layer=ribo_layer)
+    data = load_spatial_multiome(
+        str(h5ad_path),
+        rna_layer=rna_layer,
+        ribo_layer=ribo_layer,
+        cell_id_key=cell_id_key,
+    )
     print(f"Data loaded: {data.rna.shape[0]} cells × {data.rna.shape[1]} genes")
 
     # 2) 构建空间图
@@ -170,6 +178,7 @@ def train_step2(
     # 4) 准备训练数据
     rna_expr = torch.tensor(data.rna, dtype=torch.float32).to(device)
     ribo_expr = torch.tensor(data.ribo, dtype=torch.float32).to(device)
+    cell_idx = torch.tensor(data.cell_idx, dtype=torch.long).to(device)
     adj_spatial = adj_spatial.to(device)
     if w_tx is not None:
         w_tx = w_tx.to(device)
@@ -190,6 +199,7 @@ def train_step2(
     print("Initializing model...")
     model = SpatialFusionModel(
         n_genes=n_genes,
+        num_cells=data.num_cells,
         dim=dim,
         encoder_hidden=encoder_hidden,
         encoder_layers=encoder_layers,
@@ -238,7 +248,7 @@ def train_step2(
         model.train()
 
         # Forward pass
-        outputs = model(rna_expr, ribo_expr, adj_spatial)
+        outputs = model(rna_expr, ribo_expr, adj_spatial, cell_idx=cell_idx)
 
         # Compute losses
         total_loss, loss_dict = model.compute_losses(
@@ -278,7 +288,7 @@ def train_step2(
         if eval_every > 0 and y_true is not None and (epoch % eval_every == 0 or epoch == 1):
             model.eval()
             with torch.no_grad():
-                eval_outputs = model(rna_expr, ribo_expr, adj_spatial)
+                eval_outputs = model(rna_expr, ribo_expr, adj_spatial, cell_idx=cell_idx)
                 h_final_eval = eval_outputs["h_final"]
 
             from sklearn.cluster import KMeans
@@ -497,7 +507,7 @@ def train_step2(
 
     model.eval()
     with torch.no_grad():
-        outputs = model(rna_expr, ribo_expr, adj_spatial)
+        outputs = model(rna_expr, ribo_expr, adj_spatial, cell_idx=cell_idx)
         h_final = outputs["h_final"]
         weights = outputs["weights"]
 
@@ -528,6 +538,7 @@ def parse_args():
     parser.add_argument("--out_dir", type=str, default=None, help="输出目录（默认 runs/timestamp）")
     parser.add_argument("--rna_layer", type=str, default="rna_log1p", help="h5ad中RNA layer，或'X'")
     parser.add_argument("--ribo_layer", type=str, default="ribo_log1p", help="h5ad中RIBO layer，或'X'")
+    parser.add_argument("--cell_id_key", type=str, default="cell_id", help="h5ad中显式 cell id 列名")
 
     # Training
     parser.add_argument("--device", type=str, default="cuda")
@@ -598,6 +609,7 @@ def main():
         k_spatial=args.k_spatial,
         rna_layer=args.rna_layer,
         ribo_layer=args.ribo_layer,
+        cell_id_key=args.cell_id_key,
         lambda_recon=args.lambda_recon,
         lambda_contrast=args.lambda_contrast,
         lambda_link=args.lambda_link,

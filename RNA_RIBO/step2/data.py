@@ -18,6 +18,8 @@ class SpatialMultiOmics:
     ribo: np.ndarray
     coords: np.ndarray
     labels: Optional[np.ndarray]
+    cell_idx: np.ndarray
+    num_cells: int
 
 
 def _to_dense_float(arr) -> np.ndarray:
@@ -33,6 +35,7 @@ def load_spatial_multiome(
     ribo_layer: str = "ribo_log1p",
     coord_keys: Sequence[str] = ("row", "column"),
     label_key: Optional[str] = "rna_nn_alg1_label2",
+    cell_id_key: str = "cell_id",
 ) -> SpatialMultiOmics:
     """
     Load RNA/Ribo modalities plus coordinates/labels from an h5ad file.
@@ -49,11 +52,13 @@ def load_spatial_multiome(
         obs columns holding spatial coordinates (e.g., ("row", "column")).
     label_key:
         obs column for domain labels. If None or missing, labels will be None.
+    cell_id_key:
+        obs column for explicit cell/spot identifiers. Must exist.
 
     Returns
     -------
     SpatialMultiOmics
-        Contains dense float32 arrays for RNA, Ribo, coords, labels and the AnnData object.
+        Contains dense float32 arrays for RNA, Ribo, coords, labels, encoded cell_idx and AnnData.
     """
     adata = sc.read_h5ad(h5ad_path)
 
@@ -71,6 +76,12 @@ def load_spatial_multiome(
     labels = None
     if label_key is not None and label_key in adata.obs:
         labels = adata.obs[label_key].to_numpy()
+    if cell_id_key not in adata.obs:
+        raise KeyError(f"Column '{cell_id_key}' not found in obs")
+    raw_cell_ids = adata.obs[cell_id_key].to_numpy()
+    uniq_ids, cell_idx = np.unique(raw_cell_ids, return_inverse=True)
+    cell_idx = cell_idx.astype(np.int64, copy=False)
+    num_cells = int(uniq_ids.shape[0])
 
     return SpatialMultiOmics(
         adata=adata,
@@ -78,4 +89,6 @@ def load_spatial_multiome(
         ribo=ribo,
         coords=coords,
         labels=labels,
+        cell_idx=cell_idx,
+        num_cells=num_cells,
     )

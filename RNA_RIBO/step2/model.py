@@ -133,6 +133,25 @@ class Decoder(nn.Module):
         return x
 
 
+class CellCrossGating(nn.Module):
+    """Lightweight cell-aware gating: z <- z + alpha * V(c)."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.scale = dim**0.5
+
+    def forward(self, z: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        q = self.q_proj(z)
+        k = self.k_proj(c)
+        v = self.v_proj(c)
+        score = torch.sum(q * k, dim=-1, keepdim=True) / self.scale
+        alpha = torch.sigmoid(score)
+        return z + alpha * v, alpha
+
+
 def contrastive_nce_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
     """
     对齐 Z_RNA vs Z_Ribo（对称 InfoNCE）。
@@ -203,6 +222,7 @@ class SpatialFusionModel(nn.Module):
     def __init__(
         self,
         n_genes: int,
+        num_cells: int,
         dim: int = 128,
         encoder_hidden: int = 512,
         encoder_layers: int = 2,
@@ -220,6 +240,7 @@ class SpatialFusionModel(nn.Module):
         参数
         ----
         n_genes: 基因数量（输入/输出维度）
+        num_cells: cell embedding 表大小（由 cell_id 编码后的唯一数）
         dim: embedding维度
         encoder_hidden: encoder隐藏层维度
         encoder_layers: encoder层数
@@ -235,6 +256,7 @@ class SpatialFusionModel(nn.Module):
         """
         super().__init__()
         self.n_genes = n_genes
+        self.num_cells = num_cells
         self.dim = dim
 
         # 编码器：原始表达 → embedding
@@ -254,6 +276,11 @@ class SpatialFusionModel(nn.Module):
             else:
                 self.tx_proj = None
                 self.ribo_proj = None
+
+        # 显式 cell id 的共享参数表 + RNA/RIBO 独立 gating
+        self.cell_embedding = nn.Embedding(num_cells, dim)
+        self.rna_cell_gate = CellCrossGating(dim)
+        self.ribo_cell_gate = CellCrossGating(dim)
 
         # 动态注意力融合
         self.fusion = DynamicFusionAttention(dim)
@@ -285,6 +312,7 @@ class SpatialFusionModel(nn.Module):
         rna_expr: torch.Tensor,
         ribo_expr: torch.Tensor,
         adj_spatial: torch.Tensor,
+        cell_idx: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
         参数
@@ -292,6 +320,7 @@ class SpatialFusionModel(nn.Module):
         rna_expr: (N, n_genes) 原始RNA表达
         ribo_expr: (N, n_genes) 原始RIBO表达
         adj_spatial: (N, N) 空间邻接矩阵（稀疏）
+        cell_idx: (N,) 显式 cell id 编码后的索引
 
         返回
         ----
@@ -311,24 +340,40 @@ class SpatialFusionModel(nn.Module):
             z_rna = z_rna + z_tx_gene
             z_ribo = z_ribo + z_ribo_gene
 
-        # 3. 动态注意力融合
+        # 3. 显式 cell 信息融入（动态融合前）
+        if cell_idx is None:
+            raise ValueError("cell_idx is required for cell-aware fusion")
+        if cell_idx.dim() != 1:
+            raise ValueError(f"cell_idx must be 1D, got shape={tuple(cell_idx.shape)}")
+        if cell_idx.shape[0] != z_rna.shape[0]:
+            raise ValueError(
+                f"cell_idx length {cell_idx.shape[0]} != batch size {z_rna.shape[0]}"
+            )
+        cell_idx = cell_idx.long()
+        c = self.cell_embedding(cell_idx)
+        z_rna, alpha_rna = self.rna_cell_gate(z_rna, c)
+        z_ribo, alpha_ribo = self.ribo_cell_gate(z_ribo, c)
+
+        # 4. 动态注意力融合
         fused, weights = self.fusion(z_rna, z_ribo)  # (N, dim), (N, 2)
 
-        # 4. GCN空间精炼
+        # 5. GCN空间精炼
         h = fused
         for block in self.gcn_blocks:
             h = block(h, adj_spatial)
 
-        # 5. 构建输出字典
+        # 6. 构建输出字典
         out = {
             "fused": fused,  # 融合后的特征
             "h_final": h,  # GCN精炼后的最终embedding
             "weights": weights,  # 融合权重 [β_RNA, β_Ribo]
             "z_rna": z_rna,  # RNA embedding（用于对比损失）
             "z_ribo": z_ribo,  # RIBO embedding（用于对比损失）
+            "alpha_rna_cell": alpha_rna,  # cell 融入门控
+            "alpha_ribo_cell": alpha_ribo,
         }
 
-        # 6. 解码器：重构回基因表达空间
+        # 7. 解码器：重构回基因表达空间
         if self.use_decoder:
             out["recon_rna"] = self.decoder_rna(h, adj_spatial)  # (N, n_genes)
             out["recon_ribo"] = self.decoder_ribo(h, adj_spatial)  # (N, n_genes)
