@@ -25,6 +25,11 @@ from RNA_RIBO.step2.data import load_spatial_multiome  # noqa: E402
 from RNA_RIBO.step2.graph import build_spatial_knn_graph  # noqa: E402
 from RNA_RIBO.step2.starnet_weights import build_starnet_weights  # noqa: E402
 from RNA_RIBO.step2.model import SpatialFusionModel  # noqa: E402
+from RNA_RIBO.step2.checkpoint_gene_rank import (  # noqa: E402
+    evaluate_checkpoint_gene_rank,
+    extract_layer_aligned_to_reference,
+    load_gene_rank_reference,
+)
 
 
 def set_seed(seed: int) -> None:
@@ -73,6 +78,15 @@ def train_step2(
     lambda_link: float = 0.2,
     # Eval
     eval_every: int = 10,
+    ckpt_ref_csv: str = "gene_integrated_scores_weighted.csv",
+    ckpt_ref_gene_col: str = "gene",
+    ckpt_ref_rank_col: str = "rank",
+    ckpt_ribo_norm_layer: str = "rbRNA_norm",
+    ckpt_topk: int = 100,
+    ckpt_save_best_cos: bool = True,
+    ckpt_cell_chunk_size: int = 256,
+    ckpt_gene_chunk_size: int = 256,
+    ckpt_corr_block_size: int = 256,
     seed: int = 42,
 ):
     """
@@ -109,6 +123,15 @@ def train_step2(
     lambda_contrast: 对比损失权重
     lambda_link: 链接预测损失权重
     eval_every: 每隔多少epoch做一次评估（<=0关闭）
+    ckpt_ref_csv: 基因参考排序CSV路径
+    ckpt_ref_gene_col: 基因列名
+    ckpt_ref_rank_col: 排序列名（升序）
+    ckpt_ribo_norm_layer: h5ad中的RIBO归一化层名
+    ckpt_topk: checkpoint比较使用的Top-K
+    ckpt_save_best_cos: 是否保存最佳epoch的S(c,g)矩阵
+    ckpt_cell_chunk_size: (c,g)计算时的cell分块
+    ckpt_gene_chunk_size: (c,g)计算时的gene分块
+    ckpt_corr_block_size: 相关矩阵计算时的gene分块
     seed: 随机种子
     """
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -146,6 +169,15 @@ def train_step2(
                 lambda_contrast=lambda_contrast,
                 lambda_link=lambda_link,
                 eval_every=eval_every,
+                ckpt_ref_csv=ckpt_ref_csv,
+                ckpt_ref_gene_col=ckpt_ref_gene_col,
+                ckpt_ref_rank_col=ckpt_ref_rank_col,
+                ckpt_ribo_norm_layer=ckpt_ribo_norm_layer,
+                ckpt_topk=ckpt_topk,
+                ckpt_save_best_cos=ckpt_save_best_cos,
+                ckpt_cell_chunk_size=ckpt_cell_chunk_size,
+                ckpt_gene_chunk_size=ckpt_gene_chunk_size,
+                ckpt_corr_block_size=ckpt_corr_block_size,
                 seed=seed,
             ),
             indent=2,
@@ -187,13 +219,34 @@ def train_step2(
     n_genes = data.rna.shape[1]
     print(f"Input: RNA {rna_expr.shape}, RIBO {ribo_expr.shape}")
 
-    labels = data.labels
-    y_true = None
-    n_clusters = None
-    if labels is not None:
-        uniq = {v: i for i, v in enumerate(sorted(set(labels)))}
-        y_true = np.array([uniq[v] for v in labels], dtype=int)
-        n_clusters = len(np.unique(y_true))
+    if gene_dim is None:
+        raise ValueError("gene_dim must be set for gene-rank checkpoint evaluation")
+
+    # 4.1) 准备基于gene ranking的checkpoint参考
+    ref_csv_path = Path(ckpt_ref_csv)
+    if not ref_csv_path.exists():
+        candidate = Path(__file__).resolve().parents[2] / ref_csv_path
+        if candidate.exists():
+            ref_csv_path = candidate
+    print(f"Loading checkpoint reference from {ref_csv_path} ...")
+    reference = load_gene_rank_reference(
+        csv_path=ref_csv_path,
+        var_names=data.adata.var_names,
+        gene_col=ckpt_ref_gene_col,
+        rank_col=ckpt_ref_rank_col,
+        topk=ckpt_topk,
+    )
+    ribo_norm_np = extract_layer_aligned_to_reference(
+        adata=data.adata,
+        layer=ckpt_ribo_norm_layer,
+        var_indices=reference.var_indices,
+    )
+    ribo_norm = torch.tensor(ribo_norm_np, dtype=torch.float32)
+    print(
+        f"Checkpoint ranking reference: {len(reference.gene_names)} genes, "
+        f"Top-{len(reference.reference_topk)} target"
+    )
+    ref_rank_lookup = {g: i + 1 for i, g in enumerate(reference.gene_names.tolist())}
 
     # 5) 初始化模型
     print("Initializing model...")
@@ -240,8 +293,8 @@ def train_step2(
     best_epoch = -1
     no_improve = 0
     last_best = float("inf")
-    best_ari = -1.0
-    best_ari_epoch = -1
+    best_rank_metric = -1.0
+    best_rank_epoch = -1
     eval_lines = []
 
     for epoch in range(1, epochs + 1):
@@ -284,181 +337,69 @@ def train_step2(
             print(f"[epoch {epoch}] " + " ".join(f"{k}={v:.4f}" for k, v in log.items() if k not in ["epoch", "lr"]))
             print(f"  lr={log['lr']:.6f}")
 
-        # 评估（沿用 classify_umap 的聚类与指标计算逻辑，不改聚类方法）
-        if eval_every > 0 and y_true is not None and (epoch % eval_every == 0 or epoch == 1):
+        # 评估：基于(c,g)余弦与外部gene ranking的一致性
+        if eval_every > 0 and (epoch % eval_every == 0 or epoch == 1):
             model.eval()
-            with torch.no_grad():
-                eval_outputs = model(rna_expr, ribo_expr, adj_spatial, cell_idx=cell_idx)
-                h_final_eval = eval_outputs["h_final"]
-
-            from sklearn.cluster import KMeans
-            from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, homogeneity_completeness_v_measure
-
-            pred = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit_predict(
-                h_final_eval.cpu().numpy()
+            eval_metrics = evaluate_checkpoint_gene_rank(
+                model=model,
+                cell_idx=cell_idx,
+                ribo_norm=ribo_norm,
+                reference=reference,
+                topk=ckpt_topk,
+                cell_chunk_size=ckpt_cell_chunk_size,
+                gene_chunk_size=ckpt_gene_chunk_size,
+                corr_block_size=ckpt_corr_block_size,
+                save_cosine=ckpt_save_best_cos,
             )
-            ari = adjusted_rand_score(y_true, pred)
-            nmi = normalized_mutual_info_score(y_true, pred)
-            h, c, v = homogeneity_completeness_v_measure(y_true, pred)
-            eval_metrics = {
-                "epoch": epoch,
-                "ARI": ari,
-                "NMI": nmi,
-                "homogeneity": h,
-                "completeness": c,
-                "v": v,
-            }
-            eval_lines.append(eval_metrics)
-            print(f"[eval {epoch}] ARI={ari:.4f} NMI={nmi:.4f}")
+            rank_metric = float(eval_metrics["metric_topk_overlap"])
+            eval_lines.append(
+                {
+                    "epoch": epoch,
+                    "topk_overlap": rank_metric,
+                    "overlap_count": int(eval_metrics["overlap_count"]),
+                    "topk": int(eval_metrics["topk"]),
+                }
+            )
+            print(
+                f"[eval {epoch}] Top-{int(eval_metrics['topk'])} overlap="
+                f"{rank_metric:.4f} ({int(eval_metrics['overlap_count'])})"
+            )
 
-            if ari > best_ari:
-                best_ari = ari
-                best_ari_epoch = epoch
-                torch.save(model.state_dict(), out_dir / "model_best_ari.pt")
-                torch.save(
-                    {
-                        "h_final": h_final_eval.cpu(),
-                        "pred_classes": torch.tensor(pred),
-                        "epoch": epoch,
-                        "metrics": eval_metrics,
-                    },
-                    out_dir / "embeddings_best_ari.pt",
-                )
+            if rank_metric > best_rank_metric:
+                best_rank_metric = rank_metric
+                best_rank_epoch = epoch
+                torch.save(model.state_dict(), out_dir / "model_best.pt")
 
-                import matplotlib
+                gene_scores = np.asarray(eval_metrics["gene_scores"], dtype=np.float32)
+                gene_names = np.asarray(eval_metrics["gene_names"], dtype=object)
+                order = np.argsort(-gene_scores)
+                with open(out_dir / "best_gene_scores.tsv", "w", encoding="utf-8") as f:
+                    f.write("gene\tmodel_score\tmodel_rank\treference_rank\n")
+                    for ridx, gidx in enumerate(order, start=1):
+                        g = str(gene_names[gidx])
+                        ref_rank = ref_rank_lookup.get(g, "")
+                        f.write(f"{g}\t{float(gene_scores[gidx]):.8f}\t{ridx}\t{ref_rank}\n")
 
-                matplotlib.use("Agg")
-                import matplotlib.pyplot as plt
-
-                adata = data.adata
-                labels = adata.obs["rna_nn_alg1_label"].to_numpy() if "rna_nn_alg1_label" in adata.obs else None
-
-                def _resolve_coord_key(key: str):
-                    obs = adata.obs
-                    if key in obs:
-                        return key
-                    if key == "columns" and "column" in obs:
-                        return "column"
-                    if key == "column" and "columns" in obs:
-                        return "columns"
-                    if key == "rows" and "row" in obs:
-                        return "row"
-                    if key == "row" and "rows" in obs:
-                        return "rows"
-                    raise KeyError(f"Coordinate column '{key}' not found in obs")
-
-                def _label_colors(values, color_map):
-                    return np.array([color_map.get(v, "#000000") for v in values])
-
-                key_x = _resolve_coord_key("column")
-                key_y = _resolve_coord_key("row")
-                x = adata.obs[key_x].to_numpy()
-                y = -adata.obs[key_y].to_numpy()
-
-                domain_label_colors = {}
-                if labels is not None:
-                    uniq_labels = sorted(set(labels))
-                    cmap = plt.get_cmap("tab20", len(uniq_labels))
-                    domain_label_colors = {lab: cmap(i) for i, lab in enumerate(uniq_labels)}
-
-                uniq_pred = sorted(set(pred))
-                cmap_pred = plt.get_cmap("tab20", len(uniq_pred))
-                pred_color_map = {cls: cmap_pred(i) for i, cls in enumerate(uniq_pred)}
-
-                if labels is not None:
-                    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-                    axes[0].scatter(
-                        x,
-                        y,
-                        c=_label_colors(labels, domain_label_colors),
-                        s=6,
-                        alpha=1,
-                        linewidths=0,
-                        marker="o",
+                if ckpt_save_best_cos and eval_metrics["cosine_cg"] is not None:
+                    torch.save(
+                        {
+                            "cosine_cg": eval_metrics["cosine_cg"],
+                            "gene_names": gene_names.tolist(),
+                            "epoch": epoch,
+                            "metric_topk_overlap": rank_metric,
+                            "topk": int(eval_metrics["topk"]),
+                        },
+                        out_dir / "cosine_cg_best.pt",
                     )
-                    axes[0].invert_yaxis()
-                    axes[0].invert_xaxis()
-                    axes[0].axis("off")
-                    axes[0].set_title("rna_nn_alg1_label")
-
-                    axes[1].scatter(
-                        x,
-                        y,
-                        c=_label_colors(pred, pred_color_map),
-                        s=6,
-                        alpha=1,
-                        linewidths=0,
-                        marker="o",
-                    )
-                    axes[1].invert_yaxis()
-                    axes[1].invert_xaxis()
-                    axes[1].axis("off")
-                    axes[1].set_title("pred")
-
-                    plt.tight_layout()
-                    plt.savefig(out_dir / "spatial_domain_vs_pred_best_ari.png", dpi=150)
-                    plt.close()
-
-                colors = _label_colors(pred, pred_color_map)
-
-                prot = adata.obs.get("protocol-replicate", None)
-                unique_prot = prot.unique().tolist() if prot is not None else [None]
-
-                n_cols = len(unique_prot)
-                fig, axes = plt.subplots(1, n_cols, figsize=(8.4 * n_cols, 8.14))
-                if n_cols == 1:
-                    axes = [axes]
-                handles = []
-                labels_legend = []
-                for ax, val in zip(axes, unique_prot):
-                    mask = prot == val if prot is not None else np.ones_like(pred, dtype=bool)
-                    ax.scatter(x[mask], y[mask], c=colors[mask], s=6, alpha=1, linewidths=0, marker="o")
-                    ax.invert_yaxis()
-                    ax.invert_xaxis()
-                    ax.axis("off")
-                    ax.set_title(str(val))
-                if labels is not None:
-                    uniq_labels = sorted(set(labels))
-                    for lab in uniq_labels:
-                        handles.append(
-                            plt.Line2D(
-                                [0],
-                                [0],
-                                marker="o",
-                                color="w",
-                                label=str(lab),
-                                markerfacecolor=domain_label_colors.get(lab, "#000000"),
-                                markersize=6,
-                            )
-                        )
-                        labels_legend.append(str(lab))
-                else:
-                    for cls in uniq_pred:
-                        handles.append(
-                            plt.Line2D(
-                                [0],
-                                [0],
-                                marker="o",
-                                color="w",
-                                label=str(cls),
-                                markerfacecolor=pred_color_map.get(cls, "#000000"),
-                                markersize=6,
-                            )
-                        )
-                        labels_legend.append(str(cls))
-                fig.legend(handles, labels_legend, loc="upper right", bbox_to_anchor=(1.05, 1.05))
-                plt.tight_layout()
-                plt.savefig(out_dir / "spatial_pred_best_ari.png", dpi=120)
-                plt.close()
 
         # 保存最新模型
         torch.save(model.state_dict(), out_dir / "model_last.pt")
 
-        # 保存最佳模型
+        # 记录loss最优模型（不作为主checkpoint）
         if total_loss.item() < best_total:
             best_total = total_loss.item()
             best_epoch = epoch
-            torch.save(model.state_dict(), out_dir / "model_best.pt")
+            torch.save(model.state_dict(), out_dir / "model_best_loss.pt")
 
         # Early stopping
         if total_loss.item() + min_delta < last_best:
@@ -490,7 +431,7 @@ def train_step2(
                 f.write("\t".join(row) + "\n")
 
     if eval_lines:
-        eval_columns = ["epoch", "ARI", "NMI", "homogeneity", "completeness", "v"]
+        eval_columns = ["epoch", "topk_overlap", "overlap_count", "topk"]
         with open(out_dir / "eval_metrics.tsv", "w", encoding="utf-8") as f:
             f.write("\t".join(eval_columns) + "\n")
             for log in eval_lines:
@@ -515,18 +456,18 @@ def train_step2(
         {
             "h_final": h_final.cpu(),
             "weights": weights.cpu(),
-            "best_epoch": best_epoch,
+            "best_epoch": best_rank_epoch,
             "best_total": best_total,
+            "best_topk_overlap": best_rank_metric,
         },
         out_dir / "embeddings.pt",
     )
 
     print(f"\nTraining complete!")
-    print(f"Best epoch: {best_epoch}")
+    print(f"Best checkpoint epoch: {best_rank_epoch}")
+    print(f"Best Top-{ckpt_topk} overlap: {best_rank_metric:.6f}")
+    print(f"Best loss epoch: {best_epoch}")
     print(f"Best loss: {best_total:.6f}")
-    if best_ari_epoch >= 0:
-        print(f"Best ARI epoch: {best_ari_epoch}")
-        print(f"Best ARI: {best_ari:.6f}")
     print(f"Output directory: {out_dir}")
 
 
@@ -572,7 +513,16 @@ def parse_args():
     parser.add_argument("--lambda_recon", type=float, default=1.0, help="重构损失权重")
     parser.add_argument("--lambda_contrast", type=float, default=0.5, help="对比损失权重")
     parser.add_argument("--lambda_link", type=float, default=0.2, help="链接预测损失权重")
-    parser.add_argument("--eval_every", type=int, default=10, help="每隔多少epoch做一次评估（<=0关闭）")
+    parser.add_argument("--eval_every", type=int, default=10, help="每隔多少epoch做一次checkpoint评估（<=0关闭）")
+    parser.add_argument("--ckpt_ref_csv", type=str, default="gene_integrated_scores_weighted.csv", help="checkpoint参考排序CSV")
+    parser.add_argument("--ckpt_ref_gene_col", type=str, default="gene", help="参考CSV中的gene列名")
+    parser.add_argument("--ckpt_ref_rank_col", type=str, default="rank", help="参考CSV中的rank列名（升序）")
+    parser.add_argument("--ckpt_ribo_norm_layer", type=str, default="rbRNA_norm", help="h5ad中用于相关分析的RIBO归一化层")
+    parser.add_argument("--ckpt_topk", type=int, default=100, help="checkpoint比较使用Top-K")
+    parser.add_argument("--ckpt_save_best_cos", type=int, choices=[0, 1], default=1, help="是否保存最佳epoch的S(c,g)矩阵")
+    parser.add_argument("--ckpt_cell_chunk_size", type=int, default=256, help="(c,g)计算cell分块")
+    parser.add_argument("--ckpt_gene_chunk_size", type=int, default=256, help="(c,g)计算gene分块")
+    parser.add_argument("--ckpt_corr_block_size", type=int, default=256, help="相关矩阵计算gene分块")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
 
     return parser.parse_args()
@@ -614,6 +564,15 @@ def main():
         lambda_contrast=args.lambda_contrast,
         lambda_link=args.lambda_link,
         eval_every=args.eval_every,
+        ckpt_ref_csv=args.ckpt_ref_csv,
+        ckpt_ref_gene_col=args.ckpt_ref_gene_col,
+        ckpt_ref_rank_col=args.ckpt_ref_rank_col,
+        ckpt_ribo_norm_layer=args.ckpt_ribo_norm_layer,
+        ckpt_topk=args.ckpt_topk,
+        ckpt_save_best_cos=bool(args.ckpt_save_best_cos),
+        ckpt_cell_chunk_size=args.ckpt_cell_chunk_size,
+        ckpt_gene_chunk_size=args.ckpt_gene_chunk_size,
+        ckpt_corr_block_size=args.ckpt_corr_block_size,
         seed=args.seed,
     )
 

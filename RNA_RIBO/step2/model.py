@@ -307,6 +307,24 @@ class SpatialFusionModel(nn.Module):
 
         self.temperature = temperature
 
+    def get_projected_gene_embeddings(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return modality-specific gene embeddings projected into model dim.
+
+        Returns
+        -------
+        e_tx: (n_genes, dim)
+        e_ribo: (n_genes, dim)
+        """
+        if not self.use_gene_emb:
+            raise ValueError("Gene embeddings are disabled (use_gene_emb=False)")
+        e_tx = self.E_tx
+        e_ribo = self.E_ribo
+        if self.tx_proj is not None:
+            e_tx = self.tx_proj(e_tx)
+            e_ribo = self.ribo_proj(e_ribo)
+        return e_tx, e_ribo
+
     def forward(
         self,
         rna_expr: torch.Tensor,

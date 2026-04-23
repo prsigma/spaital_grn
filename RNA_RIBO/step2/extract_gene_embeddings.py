@@ -41,13 +41,13 @@ def _require_key(state: dict, key: str) -> torch.Tensor:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract E_tx/E_ribo with gene names.")
     parser.add_argument("--run_dir", required=True, type=str, help="Run directory containing args.json and model.")
-    parser.add_argument("--model_path", type=str, default=None, help="Path to model .pt (default: run_dir/model_best_ari.pt)")
+    parser.add_argument("--model_path", type=str, default=None, help="Path to model .pt (default: run_dir/model_best.pt)")
     parser.add_argument("--h5ad", type=str, default=None, help="Path to h5ad (default: read from args.json)")
     parser.add_argument("--out", type=str, default=None, help="Output .npz path (default: run_dir/gene_embeddings.npz)")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
-    model_path = Path(args.model_path) if args.model_path else run_dir / "model_best_ari.pt"
+    model_path = Path(args.model_path) if args.model_path else run_dir / "model_best.pt"
 
     if args.h5ad:
         h5ad_path = Path(args.h5ad)
